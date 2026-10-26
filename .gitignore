@@ -1,0 +1,12 @@
+__pycache__/
+.pytest_cache/
+*.pyc
+*.local
+.env
+.env.*
+private-config/
+private-session/
+results/
+*.log
+*.tsv
+!examples/*.tsv
