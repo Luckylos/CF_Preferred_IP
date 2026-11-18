@@ -43,6 +43,8 @@ _LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
 DEPLOYED_ROOT = Path("/opt/cfst")
 
 DEPLOYMENT_ONLY = [
+    "test_atomic_io.py",
+    "test_batch3_reliability.py",
     "test_batch4_misub_contract.py",
     "test_batch5_template_contract.py",
     "test_cycle_admission.py",
@@ -53,11 +55,13 @@ DEPLOYMENT_ONLY = [
     "test_cycle_status_results.py",
     "test_discovery_callers.py",
     "test_migrate.py",
+    "test_periphery_contract.py",
     "test_network_guard.py",
     "test_publish_contract.py",
     "test_publish_preflight.py",
     "test_push_to_misub.py",
     "test_shadow_mode.py",
+    "test_temp_reclaim_contract.py",
     "test_verify_tmpfs.py",
 ]
 
