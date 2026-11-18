@@ -28,6 +28,7 @@ rank.py — Contender Pool 排名：单池连续采样 + 不确定性驱动排�
 from __future__ import annotations
 
 import argparse
+from cycle_result import RankReceipt, assess_audit, preflight_receipt
 import math
 import sys
 from dataclasses import dataclass, field, replace
@@ -515,7 +516,7 @@ def segment16(ip: str) -> str:
 def diversify_publish(order: list[str], eligible: dict[str, Ranked], cfg: Config) -> list[str]:
     """发布集（前 publish_top_n）内同一 /16 最多 max_per_segment 个。
 
-    同一 /16 共享路由故障域（实测池 110 个里 93 个在 192.0.2.1274/16）。替换规则：找发布集中超额网段里
+    同一 /16 共享路由故障域（实测池 110 个里 93 个在 同一个 /16）。替换规则：找发布集中超额网段里
     lcb 最低的成员，在候补中按序找第一个所属网段未满、且 lcb ≥ 该成员 lcb − publish_margin 的 IP 换入；
     找不到则保持原样——不拿质量换多样性。被换出者落到候补原位，候补集不丢人。"""
     pub = order[: cfg.publish_top_n]
@@ -728,6 +729,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--systemic", type=int, choices=(0, 1), default=0)
     p.add_argument("--audit-ok", type=int, choices=(0, 1), default=1)
     p.add_argument("--tiers-out", type=Path, default=None)
+    p.add_argument("--result-out", type=Path, default=None)
+    p.add_argument("--audit-min-coverage-percent", type=int, default=80)
     add_config_args(p)
     return p
 
@@ -774,14 +777,9 @@ def config_from_args(args: argparse.Namespace) -> Config:
 
 
 def resolve_guard(args: argparse.Namespace) -> str:
-    if args.audit_ok == 0:
-        return "no_evidence"
-    if args.systemic == 1:
-        return "systemic"
-    if args.audit_requested is not None and args.audit_returned is not None \
-            and args.audit_requested > 0 and args.audit_returned < 0.8 * args.audit_requested:
-        return "coverage"
-    return "none"
+    return assess_audit(args.audit_requested, args.audit_returned,
+                        audit_ok=args.audit_ok != 0, systemic=args.systemic == 1,
+                        percent=getattr(args, 'audit_min_coverage_percent', 80)).guard
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -798,6 +796,11 @@ def main(argv: list[str] | None = None) -> int:
     if capacity_path.resolve() == args.blacklist.resolve():
         print("rank: quality and capacity cooldown paths must differ", file=sys.stderr)
         return 2
+    if args.result_out is not None:
+        paths = [args.history, args.contenders, args.best, args.blacklist, capacity_path]
+        if args.tiers_out is not None:
+            paths.extend([args.tiers_out, args.tiers_out / 'core.txt', args.tiers_out / 'challengers.txt'])
+        preflight_receipt(args.result_out, paths)
     guard = resolve_guard(args)
 
     contenders = read_contenders(args.contenders)   # 文件不存在 → 空池，不报错
@@ -864,13 +867,15 @@ def main(argv: list[str] | None = None) -> int:
         atomic_write(args.tiers_out / "core.txt", "".join(f"{ip}\n" for ip in out.core))
         atomic_write(args.tiers_out / "challengers.txt", "".join(f"{ip}\n" for ip in out.challengers))
 
-    print(f"rank: pool={len(new_rows)} core={len(out.core)} challengers={len(out.challengers)} "
-          f"evicted={len(out.evicted)} published={','.join(published[: cfg.publish_top_n])} "
-          f"changed={changed} guard={guard} "
-          f"evaluated={sum(c.evaluated_at != '-' for c in new_rows)} "
-          f"waiting={sum(c.evaluated_at == '-' for c in new_rows)} "
-          f"quality_evicted={sum(why != 'overflow' for _, why in out.evicted)} "
-          f"capacity_evicted={sum(why == 'overflow' for _, why in out.evicted)}")
+    receipt = RankReceipt(now.isoformat(), len(new_rows), len(out.core), len(out.challengers), len(out.evicted),
+                          published[:cfg.publish_top_n], bool(changed), guard,
+                          sum(c.evaluated_at != '-' for c in new_rows), sum(c.evaluated_at == '-' for c in new_rows),
+                          sum(why != 'overflow' for _, why in out.evicted),
+                          sum(why == 'overflow' for _, why in out.evicted), args.dry_run)
+    if args.result_out is not None:
+        receipt.write(args.result_out)
+    print(receipt.summary())
+
     return 0
 
 

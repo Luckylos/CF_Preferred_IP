@@ -10,3 +10,4 @@ results/
 *.log
 *.tsv
 !examples/*.tsv
+!tests/fixtures/*.tsv
