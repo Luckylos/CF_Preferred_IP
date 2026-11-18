@@ -69,7 +69,7 @@ if [ "$RC" -eq 124 ]; then
   # 区分 partial 与 dead：超时但已有输出的轮次，其结果仍然有效，
   # 旧实现一律 exit 0 丢弃，等于把已完成的探测白扔。
   if [ -s "$OUT" ]; then
-    PARTIAL_ROWS=$(awk 'END {print NR > 0 ? NR - 1 : 0}' "$OUT")
+    PARTIAL_ROWS=$(awk 'END {print (NR > 0 ? NR - 1 : 0)}' "$OUT")
     echo "[$(date '+%F %T')] latency scan: timeout after ${SCAN_TIMEOUT}s (partial: targets=${TARGET_COUNT} rows=${PARTIAL_ROWS}) — keeping results"
   else
     echo "[$(date '+%F %T')] latency scan: timeout after ${SCAN_TIMEOUT}s (dead: targets=${TARGET_COUNT} rows=0)"

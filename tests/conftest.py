@@ -36,28 +36,32 @@ _LOCAL_FAMILIES = {getattr(socket, "AF_UNIX", None)} - {None}
 _LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 # ── Deployment-only tests ─────────────────────────────────────────────
-# A few suites exercise the deployed layout (/opt/cfst, secrets/*.env, bin/xray)
-# rather than portable logic. They run on the host that owns that deployment and
-# are skipped on clean checkouts, so CI reports an honest skip instead of a
-# spurious failure caused by a missing production directory.
-TESTS_DIR = Path(__file__).resolve().parent
+# These suites need the deployed layout rather than portable logic: they read
+# /opt/cfst, load secrets/*.env (VLESS UUID, MiSub token) or execute bin/xray.
+# They run on the host that owns the deployment and skip on a clean checkout, so
+# CI reports an honest skip instead of failing on a missing production path.
 DEPLOYED_ROOT = Path("/opt/cfst")
-_DEPLOYMENT_MARKERS = ("/opt/cfst", "secrets/", "bin/xray")
 
+DEPLOYMENT_ONLY = [
+    "test_batch4_misub_contract.py",
+    "test_batch5_template_contract.py",
+    "test_cycle_admission.py",
+    "test_cycle_contract.py",
+    "test_cycle_result_edges.py",
+    "test_cycle_results_integration.py",
+    "test_cycle_shadow_run.py",
+    "test_cycle_status_results.py",
+    "test_discovery_callers.py",
+    "test_migrate.py",
+    "test_network_guard.py",
+    "test_publish_contract.py",
+    "test_publish_preflight.py",
+    "test_push_to_misub.py",
+    "test_shadow_mode.py",
+    "test_verify_tmpfs.py",
+]
 
-def _needs_deployment(path: Path) -> bool:
-    try:
-        content = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return False
-    return any(marker in content for marker in _DEPLOYMENT_MARKERS)
-
-
-collect_ignore = (
-    []
-    if (DEPLOYED_ROOT / "config.sh").is_file()
-    else [p.name for p in TESTS_DIR.glob("test_*.py") if _needs_deployment(p)]
-)
+collect_ignore = [] if (DEPLOYED_ROOT / "config.sh").is_file() else list(DEPLOYMENT_ONLY)
 
 # Scripts that open their own sockets, so an in-process guard cannot see them.
 _NETWORK_SCRIPTS = ("verify_vless.sh", "xray")
