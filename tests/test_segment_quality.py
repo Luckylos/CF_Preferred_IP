@@ -31,7 +31,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
-CFST = Path("/opt/cfst")
+CFST = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CFST))
 
 import segment_quality as sq  # noqa: E402
