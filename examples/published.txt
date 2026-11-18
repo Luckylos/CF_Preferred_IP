@@ -1,3 +1,0 @@
-# --- PUBLISHED (machine-readable, one address per line) ---
-192.0.2.10
-198.51.100.10

@@ -1,13 +1,53 @@
-__pycache__/
-.pytest_cache/
-*.pyc
-*.local
-.env
-.env.*
-private-config/
-private-session/
+# ── 凭据（0600，绝不入库）
+secrets/
+backups/
+
+# ── 二进制依赖（cfst / xray，运行时自备）
+cfst
+bin/
+
+# ── 运行态产物与状态
 results/
-*.log
-*.tsv
-!examples/*.tsv
-!tests/fixtures/*.tsv
+best_ips.txt
+discovered_ips.tsv
+master_ips.txt
+master_state.tsv
+probation_pool.tsv
+routes.tsv
+vless_history.tsv
+segment_verdicts.tsv
+.segment_verdicts.tsv.tmp.*
+.apply_cooldown
+.apply_state
+.apply.lock
+.probe.lock
+.push_disabled
+.health_state
+.watchdog_state
+.screen_blacklist.tsv
+.capacity_cooldown.tsv
+.verify_vless.*
+.*.state-bundle.json
+.publish_watchdog_state
+
+# ── 运维快照/备份（含真实 VLESS UUID 与 MiSub 节点 URL，绝不入库）
+.hermes/
+
+# ── 缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+*.bak
+*.bak-*
+*.bak.*
+.DS_Store
+.shadow/
+.tiers/
+*.legacy
+*.rolledback
+*.pre_rollback
+.shadow.adopted/
+contenders.tsv

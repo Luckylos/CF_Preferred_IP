@@ -24,26 +24,26 @@ def S(ts: datetime, ip: str, status: str, median: int, reason: str = ""):
 
 def test_half_life_weights_and_n_eff() -> None:
     samples = [
-        S(NOW, "198.51.100.15", "PASS", 50),
-        S(NOW - timedelta(hours=24), "198.51.100.15", "PASS", 50),
-        S(NOW - timedelta(hours=48), "198.51.100.15", "PASS", 50),
+        S(NOW, "10.0.0.1", "PASS", 50),
+        S(NOW - timedelta(hours=24), "10.0.0.1", "PASS", 50),
+        S(NOW - timedelta(hours=48), "10.0.0.1", "PASS", 50),
     ]
     assert rank.sample_weight(samples[1].ts, NOW, 24.0) == 0.5
     assert rank.sample_weight(samples[2].ts, NOW, 24.0) == 0.25
     stats = rank.ip_stats(samples, {}, NOW, 24.0, set(), 50)
-    assert math.isclose(stats["198.51.100.15"].n_eff, 1.75)
+    assert math.isclose(stats["10.0.0.1"].n_eff, 1.75)
 
 
 def test_bucket_rounds_groups_ten_minute_windows() -> None:
     t0 = datetime(2026, 10, 15, 12, 3, 0)
     samples = [
-        S(t0, "198.51.100.15", "PASS", 50),
-        S(t0 + timedelta(minutes=6), "198.51.100.16", "PASS", 50),   # 12:09 同桶
-        S(t0 + timedelta(minutes=8), "198.51.100.17", "PASS", 50),   # 12:11 下一桶
+        S(t0, "10.0.0.1", "PASS", 50),
+        S(t0 + timedelta(minutes=6), "10.0.0.2", "PASS", 50),   # 12:09 同桶
+        S(t0 + timedelta(minutes=8), "10.0.0.3", "PASS", 50),   # 12:11 下一桶
     ]
     rounds = rank.bucket_rounds(samples, 10)
     assert sorted(rounds) == [datetime(2026, 10, 15, 12, 0), datetime(2026, 10, 15, 12, 10)]
-    assert [s.ip for s in rounds[datetime(2026, 10, 15, 12, 0)]] == ["198.51.100.15", "198.51.100.16"]
+    assert [s.ip for s in rounds[datetime(2026, 10, 15, 12, 0)]] == ["10.0.0.1", "10.0.0.2"]
 
 
 def test_round_baseline_requires_ten_pass_samples() -> None:
@@ -69,15 +69,15 @@ def test_systemic_round_fail_not_charged_to_ip() -> None:
     bad_round = [S(t0, f"10.0.0.{i}", "FAIL", 0, "timeout") for i in range(5)]
     bad_round += [S(t0, f"10.0.1.{i}", "PASS", 50) for i in range(5)]  # 50% 失败
     good_round = [S(NOW, f"10.0.0.{i}", "PASS", 50) for i in range(1, 6)]
-    good_round += [S(NOW, "198.51.100.18", "FAIL", 0, "timeout")]
+    good_round += [S(NOW, "10.0.0.0", "FAIL", 0, "timeout")]
     rounds = rank.bucket_rounds(bad_round + good_round, 10)
     baselines = rank.round_baselines(rounds, 50, 10)
     assert baselines[t0].systemic_fail is True
     assert baselines[datetime(2026, 10, 15, 12, 0)].systemic_fail is False
     stats = rank.ip_stats(bad_round + good_round, baselines, NOW, 24.0, set(), 50)
     assert stats["10.0.0.1"].fail == 0.0          # 系统性轮 FAIL 不计
-    assert stats["198.51.100.18"].fail == 1.0          # 正常轮 FAIL 计入
-    assert stats["198.51.100.18"].consecutive_unreachable == 1
+    assert stats["10.0.0.0"].fail == 1.0          # 正常轮 FAIL 计入
+    assert stats["10.0.0.0"].consecutive_unreachable == 1
     assert stats["10.0.0.1"].consecutive_unreachable == 0
 
 
@@ -96,17 +96,17 @@ def test_ip_stats_tail_and_med_use_decommoned_q() -> None:
     t0 = datetime(2026, 10, 15, 11, 0, 0)
     # 一个基线 300 的轮：10 个 PASS=300，目标 IP 在该轮 PASS=350 → q=100
     crowd = [S(t0, f"10.0.9.{i}", "PASS", 300) for i in range(10)]
-    target = [S(t0, "198.51.100.15", "PASS", 350), S(NOW, "198.51.100.15", "PASS", 60)]
+    target = [S(t0, "10.0.0.1", "PASS", 350), S(NOW, "10.0.0.1", "PASS", 60)]
     rounds = rank.bucket_rounds(crowd + target, 10)
     baselines = rank.round_baselines(rounds, 50, 10)
-    stats = rank.ip_stats(crowd + target, baselines, NOW, 24.0, set(), 50)["198.51.100.15"]
+    stats = rank.ip_stats(crowd + target, baselines, NOW, 24.0, set(), 50)["10.0.0.1"]
     assert stats.tail == 100
     assert stats.med == 60
     assert stats.last_seen == NOW
 
 
 def test_consecutive_unreachable_counts_latest_streak() -> None:
-    ip = "198.51.100.15"
+    ip = "10.0.0.1"
     samples = [
         S(NOW - timedelta(hours=3), ip, "PASS", 50),
         S(NOW - timedelta(hours=2), ip, "FAIL", 0, "timeout"),
@@ -130,18 +130,18 @@ def test_utility_without_samples_is_maximally_uncertain() -> None:
 def test_load_history_window_and_validation(tmp_path: Path) -> None:
     p = tmp_path / "h.tsv"
     p.write_text(
-        "2026-10-15 11:00:00\t198.51.100.15\tPASS\t50\t\n"
-        "2026-10-07 11:00:00\t198.51.100.15\tPASS\t50\t\n"      # 超出 7 天
-        "2026-10-15 13:00:00\t198.51.100.15\tPASS\t50\t\n"      # 晚于 now
+        "2026-10-15 11:00:00\t10.0.0.1\tPASS\t50\t\n"
+        "2026-10-07 11:00:00\t10.0.0.1\tPASS\t50\t\n"      # 超出 7 天
+        "2026-10-15 13:00:00\t10.0.0.1\tPASS\t50\t\n"      # 晚于 now
         "bad line\n"
         "2026-10-15 11:00:00\t999.1.1.1\tPASS\t50\t\n"
-        "2026-10-15 11:30:00\t198.51.100.16\tFAIL\t0\ttimeout\n",
+        "2026-10-15 11:30:00\t10.0.0.2\tFAIL\t0\ttimeout\n",
         encoding="utf-8",
     )
     samples = rank.load_history(p, NOW, 7)
     assert [(s.ip, s.status, s.median, s.reason) for s in samples] == [
-        ("198.51.100.15", "PASS", 50, ""),
-        ("198.51.100.16", "FAIL", 0, "timeout"),
+        ("10.0.0.1", "PASS", 50, ""),
+        ("10.0.0.2", "FAIL", 0, "timeout"),
     ]
     assert rank.load_history(tmp_path / "missing.tsv", NOW, 7) == []
 
@@ -196,7 +196,7 @@ def test_u_tail_is_the_per_sample_curve_with_feel_thresholds() -> None:
 
 
 def test_ip_stats_mu_is_weighted_mean_of_per_sample_scores_and_fail_scores_zero() -> None:
-    ip = "198.51.100.15"
+    ip = "10.0.0.1"
     ts = [NOW - timedelta(minutes=10 * i) for i in range(4)]        # 近乎同权
     samples = [S(ts[0], ip, "PASS", 50), S(ts[1], ip, "PASS", 50), S(ts[2], ip, "PASS", 300), S(ts[3], ip, "FAIL", 0, "timeout")]
     st = rank.ip_stats(samples, {}, NOW, 24.0, set(), 50)[ip]
@@ -209,7 +209,7 @@ def test_ip_stats_mu_is_weighted_mean_of_per_sample_scores_and_fail_scores_zero(
 
 
 def test_ip_stats_peak_weight_shapes_mu_but_not_n_eff() -> None:
-    ip = "198.51.100.15"
+    ip = "10.0.0.1"
     peak = rank.parse_peak_hours("20-23,0")
     now = datetime(2026, 10, 15, 23, 0, 0)
     day = [S(now.replace(hour=h), ip, "PASS", 50) for h in (10, 12, 14, 16, 18)]   # 白天 5 个 50ms
@@ -230,7 +230,7 @@ def test_peak_ok_requires_peak_min_samples_within_24h() -> None:
     peak = rank.parse_peak_hours("20-23,0")
     assert peak == {20, 21, 22, 23, 0}
     assert rank.parse_peak_hours("22-3") == {22, 23, 0, 1, 2, 3}
-    ip = "198.51.100.15"
+    ip = "10.0.0.1"
     now = datetime(2026, 10, 16, 9, 0, 0)
     three = [S(datetime(2026, 10, 15, 20, 0), ip, "PASS", 50), S(datetime(2026, 10, 15, 22, 0), ip, "PASS", 50),
              S(datetime(2026, 10, 16, 0, 0), ip, "PASS", 50)]

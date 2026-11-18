@@ -12,7 +12,7 @@ from test_rank_policy import R, ranked
 
 NOW = datetime(2026, 10, 19, 2)
 CFG = rank.Config(pool_max=5, pool_target=2, trim_headroom=1)
-IP = '192.0.2.12'
+IP = '10.1.1.1'
 
 
 def samples(times, statuses=None):
@@ -84,7 +84,7 @@ def row(ip, lcb, *, ready, fail=0, unreachable=0):
 
 @pytest.mark.parametrize('reason', ['unworthy', 'overflow'])
 def test_pending_is_protected_from_relative_exits(reason):
-    rows = [row('198.51.100.15', .95, ready=True), row('198.51.100.16', .94, ready=True),
+    rows = [row('10.0.0.1', .95, ready=True), row('10.0.0.2', .94, ready=True),
             row(IP, .1, ready=False)]
     cfg = replace(CFG, pool_target=2 if reason == 'unworthy' else 60, pool_max=3)
     kept, removed = rank.evict(ranked(rows), cfg, 'none')
@@ -93,7 +93,7 @@ def test_pending_is_protected_from_relative_exits(reason):
 
 
 def test_completed_low_quality_can_exit():
-    rows = [row('198.51.100.15', .95, ready=True), row('198.51.100.16', .94, ready=True),
+    rows = [row('10.0.0.1', .95, ready=True), row('10.0.0.2', .94, ready=True),
             row(IP, .1, ready=True)]
     assert (IP, 'unworthy') in rank.evict(ranked(rows), CFG, 'none')[1]
 

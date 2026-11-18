@@ -516,7 +516,7 @@ def segment16(ip: str) -> str:
 def diversify_publish(order: list[str], eligible: dict[str, Ranked], cfg: Config) -> list[str]:
     """发布集（前 publish_top_n）内同一 /16 最多 max_per_segment 个。
 
-    同一 /16 共享路由故障域（实测池 110 个里 93 个在 同一个 /16）。替换规则：找发布集中超额网段里
+    同一 /16 共享路由故障域（实测池 110 个里 93 个在 172.66.0.0/16）。替换规则：找发布集中超额网段里
     lcb 最低的成员，在候补中按序找第一个所属网段未满、且 lcb ≥ 该成员 lcb − publish_margin 的 IP 换入；
     找不到则保持原样——不拿质量换多样性。被换出者落到候补原位，候补集不丢人。"""
     pub = order[: cfg.publish_top_n]

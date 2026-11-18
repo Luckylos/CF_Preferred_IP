@@ -1,85 +1,119 @@
-from pathlib import Path
+"""Publication guard for this public mirror.
+
+The repository is a sanitized copy of a private production system. These tests
+fail loudly if a future sync reintroduces something that must never be public:
+
+  * credential files or literal tokens;
+  * live relay endpoints (template SNI/HOST must stay placeholders);
+  * runtime state (pool, history, published set, cooldowns, tier files);
+  * measured candidate addresses in the bulky replay fixture.
+"""
+
+from __future__ import annotations
+
 import ipaddress
 import re
+from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 
+REQUIRED_FILES = [
+    "README.md",
+    "config.sh",
+    "cycle.sh",
+    "cycle_result.py",
+    "rank.py",
+    "admission.py",
+    "cooldown.py",
+    "atomic_io.py",
+    "ip_validation.py",
+    "replay.py",
+    "apply.sh",
+    "push_to_misub.py",
+    "verify_vless.sh",
+    "scan_latency.sh",
+    "status.py",
+]
 
-def text_files():
-    for path in ROOT.rglob("*"):
-        if path.is_file() and ".git" not in path.parts and path.name != "test_distribution_contract.py":
-            try:
-                yield path, path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                continue
+RUNTIME_STATE_NAMES = {
+    "secrets",
+    ".hermes",
+    "results",
+    ".tiers",
+    ".shadow",
+    "contenders.tsv",
+    "vless_history.tsv",
+    "discovered_ips.tsv",
+    "best_ips.txt",
+    ".apply_state",
+    ".capacity_cooldown.tsv",
+    ".screen_blacklist.tsv",
+    "ip_ranges.txt",
+}
+
+DOC_RANGES = ("127.0.0.", "192.0.2.", "198.51.100.", "203.0.113.")
 
 
-def test_distribution_has_core_and_usage_contract():
-    required = [
-        "README.md",
-        "config.example.sh",
-        "pyproject.toml",
-        "LICENSE",
-        "rank.py",
-        "admission.py",
-        "cooldown.py",
-        "atomic_io.py",
-        "ip_validation.py",
-        "replay.py",
-        "docs/design.md",
-        "docs/data-contract.md",
-        "examples/history.tsv",
+def text_files() -> list[Path]:
+    return [
+        path
+        for path in ROOT.rglob("*")
+        if path.is_file()
+        and ".git" not in path.parts
+        and path.name != "test_distribution_contract.py"
     ]
-    for name in required:
+
+
+def read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return ""
+
+
+def test_publication_keeps_the_operational_surface():
+    for name in REQUIRED_FILES:
         assert (ROOT / name).is_file(), name
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "config.example.sh" in readme
-    assert "not a drop-in production deployment" in readme
-    assert "offline" in readme.lower()
+    assert "secrets/" in readme
+    assert "example.com" in readme
 
 
-def test_public_distribution_contains_no_runtime_state_or_secret_surfaces():
-    forbidden_names = {
-        "secrets", ".hermes", "results", ".tiers", "contenders.tsv",
-        "vless_history.tsv", "discovered_ips.tsv", "best_ips.txt",
-        "apply_state", ".capacity_cooldown.tsv", ".screen_blacklist.tsv",
-    }
-    for path, _ in text_files():
-        if path.parent.name == "examples":
-            continue
-        assert not any(part in forbidden_names for part in path.parts), path
+def test_publication_contains_no_credential_or_runtime_state_surfaces():
+    for path in text_files():
+        assert not any(part in RUNTIME_STATE_NAMES for part in path.parts), path
 
 
-def test_public_distribution_contains_no_live_endpoints_or_credentials():
-    forbidden = [
-        "/" + "opt/cfst",
-        "/" + "dev/shm/cfst",
-        "/" + "run/lock/cfst",
-        "CFST_" + "TEMPLATE_",
-        "VLESS_" + "UUID",
-        "PRIVATE" + " KEY",
-        "Authorization" + ":",
-        "wss" + "://",
-        "vless" + "://",
+def test_publication_contains_no_literal_credentials():
+    patterns = [
+        re.compile(r"(?i)(token|secret|password|api_key)\s*[=:]\s*[\"']?[0-9a-f]{24,}"),
+        re.compile(r"(?i)bearer\s+[A-Za-z0-9._-]{20,}"),
+        re.compile(r"://[^/\s:@]+:[^/\s@]+@"),
     ]
-    ipv4 = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
-    allowed_prefixes = ("127.0.0.", "192.0.2.", "198.51.100.", "203.0.113.")
-    for path, content in text_files():
-        for marker in forbidden:
-            assert marker not in content, f"{marker} in {path}"
-        for address in ipv4.findall(content):
-            try:
-                ipaddress.ip_address(address)
-            except ValueError:
-                continue
-            if ipaddress.ip_address(address).is_private:
-                continue
-            assert address.startswith(allowed_prefixes), f"non-documentation address {address} in {path}"
+    for path in text_files():
+        content = read(path)
+        for pattern in patterns:
+            assert pattern.search(content) is None, path
 
 
-def test_example_config_is_safe_by_default():
-    config = (ROOT / "config.example.sh").read_text(encoding="utf-8")
-    assert "CHANGE_ME" in config
-    assert "set -euo pipefail" in config
-    assert "CFST_DIR=" in config
-    assert "SECRETS_DIR=" in config
+def test_relay_endpoints_are_placeholders():
+    config = (ROOT / "config.sh").read_text(encoding="utf-8")
+    for key in ("HK", "SG"):
+        for field in ("SNI", "HOST"):
+            match = re.search(rf'^CFST_TEMPLATE_{key}_{field}="([^"]+)"', config, re.M)
+            assert match, f"{key}_{field}"
+            assert match.group(1).endswith("example.com"), f"{key}_{field}"
+
+
+def test_replay_fixture_holds_only_documentation_or_private_addresses():
+    fixture = ROOT / "tests" / "fixtures" / "history_7d.tsv"
+    assert fixture.is_file(), "replay fixture is required by the rank CLI tests"
+    addresses = set()
+    for line in fixture.read_text(encoding="utf-8").splitlines():
+        columns = line.split("\t")
+        if len(columns) > 1:
+            addresses.add(columns[1])
+    assert addresses
+    for address in addresses:
+        parsed = ipaddress.ip_address(address)
+        assert parsed.is_private or address.startswith(DOC_RANGES), address

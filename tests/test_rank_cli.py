@@ -53,15 +53,15 @@ def test_contenders_roundtrip(tmp_path: Path) -> None:
     p = tmp_path / "c.tsv"
     p.write_text(
         "# contenders.tsv — ip\tfirst_seen\tlast_sampled\torigin\n"
-        "198.51.100.15\t2026-10-01 00:00:00\t2026-10-02 00:00:00\tmaster\n"
-        "198.51.100.16\t2026-10-01 00:00:00\t-\tscreen\n"
-        "198.51.100.15\t2026-10-03 00:00:00\t-\tdup\n"       # 重复：保留首见
+        "10.0.0.1\t2026-10-01 00:00:00\t2026-10-02 00:00:00\tmaster\n"
+        "10.0.0.2\t2026-10-01 00:00:00\t-\tscreen\n"
+        "10.0.0.1\t2026-10-03 00:00:00\t-\tdup\n"       # 重复：保留首见
         "999.0.0.1\t2026-10-01 00:00:00\t-\tbad\n"
         "\n",
         encoding="utf-8",
     )
     rows = rank.read_contenders(p)
-    assert [r.ip for r in rows] == ["198.51.100.15", "198.51.100.16"]
+    assert [r.ip for r in rows] == ["10.0.0.1", "10.0.0.2"]
     assert rows[0].origin == "master" and rows[1].last_sampled == "-"
     out = tmp_path / "o.tsv"
     rank.write_contenders(out, rows)
@@ -74,7 +74,7 @@ def test_contenders_roundtrip(tmp_path: Path) -> None:
 
 def test_dry_run_writes_nothing(tmp_path: Path) -> None:
     env = make_env(tmp_path)
-    env["best"].write_text(rank.BEST_MARKER + "\n203.0.113.10\n", encoding="utf-8")
+    env["best"].write_text(rank.BEST_MARKER + "\n1.1.1.1\n", encoding="utf-8")
     before = {p: (p.stat().st_mtime_ns, p.read_bytes()) for p in (env["contenders"], env["best"])}
     r = run_rank(base_args(env) + ["--dry-run"])
     assert r.returncode == 0, r.stderr
@@ -151,14 +151,14 @@ def test_idempotent_second_run_is_byte_identical(tmp_path: Path) -> None:
 
 
 def test_unsampled_contender_kept_and_history_only_ip_not_admitted(tmp_path: Path) -> None:
-    hist = "".join(f"2026-10-15 1{h}:00:00\t198.51.100.15\tPASS\t50\t\n" for h in range(6))
-    hist += "2026-10-15 15:00:00\t198.51.100.19\tPASS\t45\t\n"
-    env = make_env(tmp_path, history=hist, pool_ips=["198.51.100.15", "198.51.100.16"])
+    hist = "".join(f"2026-10-15 1{h}:00:00\t10.0.0.1\tPASS\t50\t\n" for h in range(6))
+    hist += "2026-10-15 15:00:00\t10.0.0.9\tPASS\t45\t\n"
+    env = make_env(tmp_path, history=hist, pool_ips=["10.0.0.1", "10.0.0.2"])
     r = run_rank(base_args(env))
     assert r.returncode == 0, r.stderr
     rows = {row.ip: row for row in rank.read_contenders(env["contenders"])}
-    assert set(rows) == {"198.51.100.15", "198.51.100.16"}
-    assert rows["198.51.100.16"].last_sampled == "2026-10-08 00:00:00"
+    assert set(rows) == {"10.0.0.1", "10.0.0.2"}
+    assert rows["10.0.0.2"].last_sampled == "2026-10-08 00:00:00"
     s = summary_of(r.stdout)
     assert s["published"] == "" and s["changed"] == "0"
     assert not env["best"].exists()        # 合格数 <3 不写 best
@@ -172,17 +172,17 @@ def _guard_env(tmp_path: Path) -> dict[str, Path]:
     stamps = ["2026-10-14 20:00:00", "2026-10-14 22:00:00", "2026-10-15 00:00:00"] + \
              [f"2026-10-15 {h:02d}:00:00" for h in range(8, 16)]
     for ts in stamps:
-        for ip, ms in (("198.51.100.15", 50), ("198.51.100.16", 55), ("198.51.100.17", 60)):
+        for ip, ms in (("10.0.0.1", 50), ("10.0.0.2", 55), ("10.0.0.3", 60)):
             hist += f"{ts}\t{ip}\tPASS\t{ms}\t\n"
-        hist += f"{ts}\t198.51.100.20\tFAIL\t0\ttimeout\n"
-    return make_env(tmp_path, history=hist, pool_ips=["198.51.100.15", "198.51.100.16", "198.51.100.17", "198.51.100.20"])
+        hist += f"{ts}\t10.0.0.4\tFAIL\t0\ttimeout\n"
+    return make_env(tmp_path, history=hist, pool_ips=["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"])
 
 
 def test_guard_none_evicts(tmp_path: Path) -> None:
     env = _guard_env(tmp_path)
     s = summary_of(run_rank(base_args(env)).stdout)
     assert s["evicted"] == "1" and s["guard"] == "none" and s["pool"] == "3"
-    assert env["blacklist"].read_text(encoding="utf-8") == "198.51.100.20\t2026-10-15 16:10:00\n"
+    assert env["blacklist"].read_text(encoding="utf-8") == "10.0.0.4\t2026-10-15 16:10:00\n"
 
 
 def test_guard_coverage_systemic_no_evidence(tmp_path: Path) -> None:
@@ -209,17 +209,17 @@ def test_guard_coverage_systemic_no_evidence(tmp_path: Path) -> None:
             assert s["changed"] == "0" and s["published"] == "" and not env["best"].exists()
             # 统计仍更新
             rows = {row.ip: row for row in rank.read_contenders(env["contenders"])}
-            assert rows["198.51.100.15"].last_sampled == "2026-10-15 15:00:00"
+            assert rows["10.0.0.1"].last_sampled == "2026-10-15 15:00:00"
         else:
             assert s["changed"] == "1" and env["best"].exists()
 
 
 def test_no_evidence_keeps_incumbents_in_summary(tmp_path: Path) -> None:
     env = _guard_env(tmp_path)
-    env["best"].write_text(rank.BEST_MARKER + "\n198.51.100.17\n198.51.100.16\n198.51.100.15\n", encoding="utf-8")
+    env["best"].write_text(rank.BEST_MARKER + "\n10.0.0.3\n10.0.0.2\n10.0.0.1\n", encoding="utf-8")
     mtime = env["best"].stat().st_mtime_ns
     s = summary_of(run_rank(base_args(env) + ["--audit-ok", "0"]).stdout)
-    assert s["published"] == "198.51.100.17,198.51.100.16,198.51.100.15" and s["changed"] == "0"
+    assert s["published"] == "10.0.0.3,10.0.0.2,10.0.0.1" and s["changed"] == "0"
     assert env["best"].stat().st_mtime_ns == mtime
 
 
@@ -227,13 +227,13 @@ def test_auto_systemic_round_escalates_guard(tmp_path: Path) -> None:
     # 最新轮（16:00）6 个样本里 3 FAIL → 轮失败率 50% → guard=systemic，不淘汰
     (tmp_path / "a").mkdir()
     env = _guard_env(tmp_path / "a")
-    extra = ("2026-10-15 16:00:00\t198.51.100.15\tPASS\t50\t\n"
-             "2026-10-15 16:00:00\t198.51.100.16\tPASS\t55\t\n"
-             "2026-10-15 16:00:00\t198.51.100.17\tFAIL\t0\ttimeout\n"
-             "2026-10-15 16:00:00\t198.51.100.20\tFAIL\t0\ttimeout\n"
-             # 198.51.100.21/.6 不在池内，但轮基线/系统性判定使用全部 history 样本（≥5 样本门槛）
-             "2026-10-15 16:00:00\t198.51.100.21\tFAIL\t0\ttimeout\n"
-             "2026-10-15 16:00:00\t198.51.100.22\tPASS\t52\t\n")
+    extra = ("2026-10-15 16:00:00\t10.0.0.1\tPASS\t50\t\n"
+             "2026-10-15 16:00:00\t10.0.0.2\tPASS\t55\t\n"
+             "2026-10-15 16:00:00\t10.0.0.3\tFAIL\t0\ttimeout\n"
+             "2026-10-15 16:00:00\t10.0.0.4\tFAIL\t0\ttimeout\n"
+             # 10.0.0.5/.6 不在池内，但轮基线/系统性判定使用全部 history 样本（≥5 样本门槛）
+             "2026-10-15 16:00:00\t10.0.0.5\tFAIL\t0\ttimeout\n"
+             "2026-10-15 16:00:00\t10.0.0.6\tPASS\t52\t\n")
     env["history"].write_text(env["history"].read_text(encoding="utf-8") + extra, encoding="utf-8")
     r = run_rank(base_args(env, now="2026-10-15 16:05:00"))
     assert r.returncode == 0, r.stderr

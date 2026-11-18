@@ -6,7 +6,7 @@ atomic_write（mkstemp → fdopen → flush → fsync → os.replace，异常时
 本文件先以 owner identity 探针固定「两处必须是同一实现」，再冻结该实现的
 用户可观察行为：成功落盘、os.replace 失败时旧字节保留且不留临时文件。
 
-所有断言只使用临时 sandbox，不访问网络，也不修改 <repo-root> 运行态文件。
+所有断言只使用临时 sandbox，不访问网络，也不修改 /opt/cfst 运行态文件。
 """
 from __future__ import annotations
 

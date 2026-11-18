@@ -32,14 +32,14 @@ def ranked(rows: list[rank.Ranked]) -> list[rank.Ranked]:
 
 def test_derive_tiers_core_challenger_reserve() -> None:
     rows = [R(f"10.0.0.{i}", 0.90 - i * 0.01) for i in range(10)]      # lcb 0.90..0.81
-    rows += [R("198.51.100.10", 0.80, ucb=0.805), R("198.51.100.11", 0.79, ucb=0.81)]  # ucb ≤ 0.81 → reserve
-    rows.append(R("198.51.100.12", 0.50, ucb=0.85, n_eff=1.0))             # ucb > core 末位 lcb(0.81)
-    rows.append(R("198.51.100.13", 0.50, ucb=0.70, n_eff=1.0))             # reserve
-    rows.append(R("198.51.100.14", 0.95, ucb=0.99, n_eff=2.0))             # n_eff<3 不进 core 但是 challenger
+    rows += [R("10.0.0.10", 0.80, ucb=0.805), R("10.0.0.11", 0.79, ucb=0.81)]  # ucb ≤ 0.81 → reserve
+    rows.append(R("10.0.1.1", 0.50, ucb=0.85, n_eff=1.0))             # ucb > core 末位 lcb(0.81)
+    rows.append(R("10.0.1.2", 0.50, ucb=0.70, n_eff=1.0))             # reserve
+    rows.append(R("10.0.1.3", 0.95, ucb=0.99, n_eff=2.0))             # n_eff<3 不进 core 但是 challenger
     core, chal, reserve = rank.derive_tiers(ranked(rows), CFG)
     assert core == [f"10.0.0.{i}" for i in range(10)]
-    assert set(chal) == {"198.51.100.14", "198.51.100.12"}
-    assert "198.51.100.10" in reserve and "198.51.100.11" in reserve and "198.51.100.13" in reserve
+    assert set(chal) == {"10.0.1.3", "10.0.1.1"}
+    assert "10.0.0.10" in reserve and "10.0.0.11" in reserve and "10.0.1.2" in reserve
 
 
 def test_derive_tiers_challenger_capped() -> None:
@@ -57,11 +57,11 @@ def _big_pool(n: int = 61) -> list[rank.Ranked]:
 
 def test_evict_rule1_ucb_below_pool_target_lcb() -> None:
     rows = _big_pool(60)                       # 60 个成熟 IP，第 60 名 lcb = 0.841
-    rows.append(R("192.0.2.10", 0.50, ucb=0.80, n_eff=8.0))
-    rows.append(R("192.0.2.11", 0.50, ucb=0.80, n_eff=7.9))   # n_eff<evict_min_neff(8) 豁免
+    rows.append(R("10.9.9.9", 0.50, ucb=0.80, n_eff=8.0))
+    rows.append(R("10.9.9.8", 0.50, ucb=0.80, n_eff=7.9))   # n_eff<evict_min_neff(8) 豁免
     kept, evicted = rank.evict(ranked(rows), CFG, guard="none")
-    assert dict(evicted) == {"192.0.2.10": "unworthy"}
-    assert "192.0.2.11" in kept
+    assert dict(evicted) == {"10.9.9.9": "unworthy"}
+    assert "10.9.9.8" in kept
 
 
 def test_evict_rule1_threshold_uses_proven_ips_only() -> None:
@@ -69,28 +69,28 @@ def test_evict_rule1_threshold_uses_proven_ips_only() -> None:
     # 阈值只能来自已证明 IP；不足 POOL_TARGET 个则不触发。
     proven = [R(f"10.0.{i // 256}.{i % 256}", 0.90 - i * 0.001) for i in range(30)]
     fresh = [R(f"10.1.{i // 256}.{i % 256}", 0.845, ucb=1.0, n_eff=2.0) for i in range(169)]
-    weak = R("192.0.2.10", 0.70, ucb=0.80, n_eff=18.0)    # 成熟但 ucb 低于试用者 lcb
+    weak = R("10.9.9.9", 0.70, ucb=0.80, n_eff=18.0)    # 成熟但 ucb 低于试用者 lcb
     cfg = rank.Config(trim_headroom=0)                   # 隔离规则 1（规则 4 见 test_evict_rule4_*）
     kept, evicted = rank.evict(ranked(proven + fresh + [weak]), cfg, guard="none")
-    assert evicted == [] and "192.0.2.10" in kept         # 已证明 IP 只有 31 个 < 60 → 不触发
+    assert evicted == [] and "10.9.9.9" in kept         # 已证明 IP 只有 31 个 < 60 → 不触发
     proven60 = [R(f"10.0.{i // 256}.{i % 256}", 0.90 - i * 0.001) for i in range(60)]
     kept, evicted = rank.evict(ranked(proven60 + fresh + [weak]), cfg, guard="none")
-    assert dict(evicted) == {"192.0.2.10": "unworthy"}     # 第 60 名已证明 lcb=0.841 > ucb 0.80
+    assert dict(evicted) == {"10.9.9.9": "unworthy"}     # 第 60 名已证明 lcb=0.841 > ucb 0.80
 
 
 def test_evict_rule2_hard_fail() -> None:
     # 硬失败按置信下界：0.5@n=40 下界≈0.42 > 0.30 → 淘汰；n_eff<3 豁免；0.31@n=3 见下一个测试
-    rows = [R("198.51.100.15", 0.9), R("198.51.100.16", 0.5, fail=0.5, n_eff=40.0),
-            R("198.51.100.17", 0.5, fail=0.9, n_eff=2.5)]
+    rows = [R("10.0.0.1", 0.9), R("10.0.0.2", 0.5, fail=0.5, n_eff=40.0),
+            R("10.0.0.3", 0.5, fail=0.9, n_eff=2.5)]
     kept, evicted = rank.evict(ranked(rows), CFG, guard="none")
-    assert dict(evicted) == {"198.51.100.16": "hard_fail"}
+    assert dict(evicted) == {"10.0.0.2": "hard_fail"}
 
 
 def test_evict_rule3_consecutive_unreachable() -> None:
-    rows = [R("198.51.100.15", 0.9), R("198.51.100.16", 0.5, unreachable=3, n_eff=1.0),
-            R("198.51.100.17", 0.5, unreachable=2)]
+    rows = [R("10.0.0.1", 0.9), R("10.0.0.2", 0.5, unreachable=3, n_eff=1.0),
+            R("10.0.0.3", 0.5, unreachable=2)]
     kept, evicted = rank.evict(ranked(rows), CFG, guard="none")
-    assert dict(evicted) == {"198.51.100.16": "unreachable"}
+    assert dict(evicted) == {"10.0.0.2": "unreachable"}
 
 
 def test_evict_rule4_overflow_trims_only_characterized_lowest_ucb_and_at_most_headroom() -> None:
@@ -113,7 +113,7 @@ def test_evict_rule4_overflow_trims_only_characterized_lowest_ucb_and_at_most_he
     assert rank.evict(ranked(mature + weak[:10]), cfg, guard="none")[1] == []
     # 只差 3 个：只裁 3 个
     kept, evicted = rank.evict(ranked(mature + weak[:13]), cfg, guard="none")
-    assert len(evicted) == 3 and set(dict(evicted)) == {f"10.2.0.{i}" for i in range(10, 13)}
+    assert len(evicted) == 3 and set(dict(evicted)) == {"10.2.0.10", "10.2.0.11", "10.2.0.12"}
     # 优质 + 未表征：前 POOL_TARGET 名受保护，裁不到任何人（快筛暂停，先把手里的看清楚）
     assert rank.evict(ranked(mature + fresh), cfg, guard="none")[1] == []
     # 守卫轮不裁
@@ -122,7 +122,7 @@ def test_evict_rule4_overflow_trims_only_characterized_lowest_ucb_and_at_most_he
 
 def test_evict_guard_blocks_all_rules() -> None:
     rows = _big_pool(95)
-    rows.append(R("192.0.2.10", 0.1, ucb=0.2, n_eff=5.0, fail=0.5, unreachable=3))
+    rows.append(R("10.9.9.9", 0.1, ucb=0.2, n_eff=5.0, fail=0.5, unreachable=3))
     for guard in ("coverage", "systemic", "no_evidence"):
         kept, evicted = rank.evict(ranked(rows), CFG, guard=guard)
         assert evicted == [] and len(kept) == 96
@@ -130,11 +130,11 @@ def test_evict_guard_blocks_all_rules() -> None:
 
 def test_blacklist_line_format(tmp_path: Path) -> None:
     bl = tmp_path / "bl.tsv"
-    bl.write_text("203.0.113.10\t2026-10-14 00:00:00\n", encoding="utf-8")
-    rank.append_blacklist(bl, ["198.51.100.16", "198.51.100.17"], NOW)
+    bl.write_text("1.1.1.1\t2026-10-14 00:00:00\n", encoding="utf-8")
+    rank.append_blacklist(bl, ["10.0.0.2", "10.0.0.3"], NOW)
     assert bl.read_text(encoding="utf-8") == (
-        "203.0.113.10\t2026-10-14 00:00:00\n"
-        "198.51.100.16\t2026-10-15 12:00:00\n198.51.100.17\t2026-10-15 12:00:00\n"
+        "1.1.1.1\t2026-10-14 00:00:00\n"
+        "10.0.0.2\t2026-10-15 12:00:00\n10.0.0.3\t2026-10-15 12:00:00\n"
     )
 
 
@@ -191,11 +191,11 @@ def test_write_best_marker_and_publish_set_parse(tmp_path: Path) -> None:
 
 def test_evict_rule2_uses_fail_lower_bound_not_point_estimate() -> None:
     # 3 样本 1 失败 = 33% 点估计，但下界≈0.14 < 0.30 → 不是硬失败；40 样本 50% 下界≈0.42 → 淘汰
-    rows = [R("198.51.100.15", 0.9), R("198.51.100.16", 0.5, fail=1 / 3, n_eff=3.0),
-            R("198.51.100.17", 0.5, fail=0.5, n_eff=40.0)]
+    rows = [R("10.0.0.1", 0.9), R("10.0.0.2", 0.5, fail=1 / 3, n_eff=3.0),
+            R("10.0.0.3", 0.5, fail=0.5, n_eff=40.0)]
     kept, evicted = rank.evict(ranked(rows), CFG, guard="none")
-    assert dict(evicted) == {"198.51.100.17": "hard_fail"}
-    assert "198.51.100.16" in kept
+    assert dict(evicted) == {"10.0.0.3": "hard_fail"}
+    assert "10.0.0.2" in kept
 
 
 # ── 挑战者分槽 ──────────────────────────────────────────────────────────
@@ -219,9 +219,9 @@ def test_derive_tiers_splits_challengers_into_explore_and_promote_slots() -> Non
 def test_derive_tiers_slots_backfill_each_other() -> None:
     core_rows = [R(f"10.0.0.{i}", 0.90 - i * 0.01) for i in range(10)]
     fresh = [R(f"10.1.0.{i}", 0.30, ucb=0.99, n_eff=1.0) for i in range(12)]
-    maturing = [R("203.0.113.13", 0.70, ucb=0.90, n_eff=4.5)]
+    maturing = [R("10.2.0.1", 0.70, ucb=0.90, n_eff=4.5)]
     core, chal, _ = rank.derive_tiers(ranked(core_rows + fresh + maturing), CFG)
-    assert "203.0.113.13" in chal and len(chal) == 10 and sum(ip.startswith("10.1.") for ip in chal) == 9
+    assert "10.2.0.1" in chal and len(chal) == 10 and sum(ip.startswith("10.1.") for ip in chal) == 9
     core, chal, _ = rank.derive_tiers(ranked(core_rows + maturing * 1 + [
         R(f"10.2.0.{i}", 0.70, ucb=0.90, n_eff=4.5) for i in range(2, 14)]), CFG)
     assert len(chal) == 10 and all(ip.startswith("10.2.") for ip in chal), "无探索候选时晋升槽补满"
@@ -249,44 +249,44 @@ def test_config_explore_slots_default_and_cli() -> None:
 # 不超过滞回（publish_margin）的跨段合格者时才替换，不拿质量换多样性。
 
 def test_publish_diversity_caps_two_per_slash16_when_alternative_within_margin() -> None:
-    rows = ranked([R("192.0.2.1275", 0.900), R("192.0.2.1090", 0.895), R("192.0.2.1276", 0.890),
-                   R("203.0.113.191", 0.885), R("192.0.2.1277", 0.880)])
+    rows = ranked([R("172.66.1.1", 0.900), R("172.66.1.2", 0.895), R("172.66.1.3", 0.890),
+                   R("104.21.1.1", 0.885), R("172.66.1.4", 0.880)])
     out = rank.sticky_publish(rows, [], CFG, evicted=set())
-    assert out[:3] == ["192.0.2.1275", "192.0.2.1090", "203.0.113.191"], out
-    assert set(out) == {"192.0.2.1275", "192.0.2.1090", "192.0.2.1276", "203.0.113.191", "192.0.2.1277"}, "候补集仍完整"
+    assert out[:3] == ["172.66.1.1", "172.66.1.2", "104.21.1.1"], out
+    assert set(out) == {"172.66.1.1", "172.66.1.2", "172.66.1.3", "104.21.1.1", "172.66.1.4"}, "候补集仍完整"
 
 
 def test_publish_diversity_does_not_sacrifice_quality_beyond_margin() -> None:
-    rows = ranked([R("192.0.2.1275", 0.900), R("192.0.2.1090", 0.895), R("192.0.2.1276", 0.890),
-                   R("203.0.113.191", 0.860)])                       # 差距 0.03 > margin 0.02
+    rows = ranked([R("172.66.1.1", 0.900), R("172.66.1.2", 0.895), R("172.66.1.3", 0.890),
+                   R("104.21.1.1", 0.860)])                       # 差距 0.03 > margin 0.02
     out = rank.sticky_publish(rows, [], CFG, evicted=set())
-    assert out[:3] == ["192.0.2.1275", "192.0.2.1090", "192.0.2.1276"]
+    assert out[:3] == ["172.66.1.1", "172.66.1.2", "172.66.1.3"]
 
 
 def test_publish_diversity_is_sticky_and_replaces_lowest_same_segment_incumbent() -> None:
     # 在任 [A(172.66), B(172.66), C(104.21)]：新同段 D 以超滞回优势换入第 3 位会形成 3×172.66；
     # C 与 D 差距 > margin，不以 C 替代 D（质量优先）→ 允许 3×172.66
-    rows = ranked([R("192.0.2.1277", 0.930), R("192.0.2.1275", 0.900), R("192.0.2.1090", 0.895),
-                   R("203.0.113.191", 0.870)])
-    out = rank.sticky_publish(rows, ["192.0.2.1275", "192.0.2.1090", "203.0.113.191"], CFG, evicted=set())
-    assert out[:3] == ["192.0.2.1277", "192.0.2.1275", "192.0.2.1090"]
+    rows = ranked([R("172.66.1.4", 0.930), R("172.66.1.1", 0.900), R("172.66.1.2", 0.895),
+                   R("104.21.1.1", 0.870)])
+    out = rank.sticky_publish(rows, ["172.66.1.1", "172.66.1.2", "104.21.1.1"], CFG, evicted=set())
+    assert out[:3] == ["172.66.1.4", "172.66.1.1", "172.66.1.2"]
     # 若另有跨段合格者 E 在滞回内，则替换发布集中 lcb 最低的同段成员
-    rows = ranked([R("192.0.2.1277", 0.930), R("192.0.2.1275", 0.900), R("192.0.2.1090", 0.895),
-                   R("203.0.113.114", 0.880), R("203.0.113.191", 0.870)])
-    out = rank.sticky_publish(rows, ["192.0.2.1275", "192.0.2.1090", "203.0.113.191"], CFG, evicted=set())
-    assert out[:3] == ["192.0.2.1277", "192.0.2.1275", "203.0.113.114"]
+    rows = ranked([R("172.66.1.4", 0.930), R("172.66.1.1", 0.900), R("172.66.1.2", 0.895),
+                   R("104.18.1.1", 0.880), R("104.21.1.1", 0.870)])
+    out = rank.sticky_publish(rows, ["172.66.1.1", "172.66.1.2", "104.21.1.1"], CFG, evicted=set())
+    assert out[:3] == ["172.66.1.4", "172.66.1.1", "104.18.1.1"]
 
 
 def test_publish_diversity_leaves_already_diverse_set_untouched() -> None:
-    rows = ranked([R("203.0.113.114", 0.900), R("203.0.113.191", 0.895), R("192.0.2.1275", 0.890), R("192.0.2.1090", 0.889)])
-    out = rank.sticky_publish(rows, ["203.0.113.114", "203.0.113.191", "192.0.2.1275"], CFG, evicted=set())
-    assert out[:3] == ["203.0.113.114", "203.0.113.191", "192.0.2.1275"]
+    rows = ranked([R("104.18.1.1", 0.900), R("104.21.1.1", 0.895), R("172.66.1.1", 0.890), R("172.66.1.2", 0.889)])
+    out = rank.sticky_publish(rows, ["104.18.1.1", "104.21.1.1", "172.66.1.1"], CFG, evicted=set())
+    assert out[:3] == ["104.18.1.1", "104.21.1.1", "172.66.1.1"]
 
 
 def test_publish_diversity_can_be_disabled() -> None:
     cfg = rank.Config(max_per_segment=0)
-    rows = ranked([R("192.0.2.1275", 0.900), R("192.0.2.1090", 0.895), R("192.0.2.1276", 0.890), R("203.0.113.191", 0.885)])
-    assert rank.sticky_publish(rows, [], cfg, evicted=set())[:3] == ["192.0.2.1275", "192.0.2.1090", "192.0.2.1276"]
+    rows = ranked([R("172.66.1.1", 0.900), R("172.66.1.2", 0.895), R("172.66.1.3", 0.890), R("104.21.1.1", 0.885)])
+    assert rank.sticky_publish(rows, [], cfg, evicted=set())[:3] == ["172.66.1.1", "172.66.1.2", "172.66.1.3"]
 
 
 def test_evict_rule1_requires_more_evidence_than_core_membership() -> None:
@@ -295,10 +295,11 @@ def test_evict_rule1_requires_more_evidence_than_core_membership() -> None:
     # 已证明阈值与 core 资格用 min_neff=3；规则 2/3 不受影响。
     assert rank.Config().evict_min_neff == 8.0
     proven = [R(f"10.0.{i // 256}.{i % 256}", 0.90 - i * 0.001) for i in range(60)]
-    young = R("192.0.2.10", 0.30, ucb=0.50, n_eff=6.5)
-    old = R("192.0.2.11", 0.30, ucb=0.50, n_eff=8.0)
+    young = R("10.9.9.9", 0.30, ucb=0.50, n_eff=6.5)
+    old = R("10.9.9.8", 0.30, ucb=0.50, n_eff=8.0)
     kept, evicted = rank.evict(ranked(proven + [young, old]), CFG, guard="none")
-    assert dict(evicted) == {"192.0.2.11": "unworthy"} and "192.0.2.10" in kept
-    failing = R("192.0.2.12", 0.30, ucb=0.50, n_eff=3.0, fail=1.0)   # 规则 2 仍只需 n_eff≥3
+    assert dict(evicted) == {"10.9.9.8": "unworthy"} and "10.9.9.9" in kept
+    failing = R("10.9.9.7", 0.30, ucb=0.50, n_eff=3.0, fail=1.0)   # 规则 2 仍只需 n_eff≥3
     kept, evicted = rank.evict(ranked(proven + [failing]), CFG, guard="none")
-    assert dict(evicted) == {"192.0.2.12": "hard_fail"}
+    assert dict(evicted) == {"10.9.9.7": "hard_fail"}
+

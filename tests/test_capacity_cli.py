@@ -11,7 +11,7 @@ import rank
 def test_overflow_does_not_enter_quality_blacklist(tmp_path):
     now = datetime(2026, 10, 19, 12)
     hist, pool, best, quality, capacity = [tmp_path/n for n in ['history', 'pool', 'best', 'quality', 'capacity']]
-    ips = ['198.51.100.15', '198.51.100.16', '198.51.100.17']
+    ips = ['10.0.0.1', '10.0.0.2', '10.0.0.3']
     saved = '2026-10-18 01:00:00'
     rank.write_contenders(pool, [rank.Contender(ip, '2026-10-16 12:00:00', '-', 'screen', saved) for ip in ips])
     hist.write_text(''.join(f'{(now-timedelta(minutes=i*15)).strftime(rank.TS_FORMAT)}\t{ip}\tPASS\t50\t\n' for i in range(40) for ip in ips))
@@ -29,7 +29,7 @@ def test_overflow_does_not_enter_quality_blacklist(tmp_path):
 
 def test_cli_rejects_invalid_cooldown_before_writing(tmp_path):
     pool = tmp_path/'pool'
-    pool.write_text('198.51.100.15\t2026-10-16 12:00:00\t-\tscreen\n')
+    pool.write_text('10.0.0.1\t2026-10-16 12:00:00\t-\tscreen\n')
     before = pool.read_bytes()
     base = [sys.executable, str(ROOT/'rank.py'), '--history', str(tmp_path/'history'),
             '--contenders', str(pool), '--best', str(tmp_path/'best'), '--blacklist', str(tmp_path/'quality'),

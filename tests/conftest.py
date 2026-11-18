@@ -33,7 +33,7 @@ from typing import Any
 
 # AF_UNIX never leaves the host, and local tooling may legitimately use it.
 _LOCAL_FAMILIES = {getattr(socket, "AF_UNIX", None)} - {None}
-_LOCAL_HOSTS = {"198.51.100.10", "::1", "localhost"}
+_LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 # Scripts that open their own sockets, so an in-process guard cannot see them.
 _NETWORK_SCRIPTS = ("verify_vless.sh", "xray")
