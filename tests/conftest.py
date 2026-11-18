@@ -35,6 +35,30 @@ from typing import Any
 _LOCAL_FAMILIES = {getattr(socket, "AF_UNIX", None)} - {None}
 _LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
+# ── Deployment-only tests ─────────────────────────────────────────────
+# A few suites exercise the deployed layout (/opt/cfst, secrets/*.env, bin/xray)
+# rather than portable logic. They run on the host that owns that deployment and
+# are skipped on clean checkouts, so CI reports an honest skip instead of a
+# spurious failure caused by a missing production directory.
+TESTS_DIR = Path(__file__).resolve().parent
+DEPLOYED_ROOT = Path("/opt/cfst")
+_DEPLOYMENT_MARKERS = ("/opt/cfst", "secrets/", "bin/xray")
+
+
+def _needs_deployment(path: Path) -> bool:
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return any(marker in content for marker in _DEPLOYMENT_MARKERS)
+
+
+collect_ignore = (
+    []
+    if (DEPLOYED_ROOT / "config.sh").is_file()
+    else [p.name for p in TESTS_DIR.glob("test_*.py") if _needs_deployment(p)]
+)
+
 # Scripts that open their own sockets, so an in-process guard cannot see them.
 _NETWORK_SCRIPTS = ("verify_vless.sh", "xray")
 
