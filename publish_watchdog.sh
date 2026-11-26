@@ -45,6 +45,8 @@ if ! source "$CFST_CONFIG" 2>/dev/null; then
   exit 0
 fi
 
+# 发布落地方式决定告警文案与失败线索（2026-11-22 起默认 dns）。
+PUBLISH_MODE="${CFST_PUBLISH:-misub}"
 STATE_FILE="${PUBLISH_WATCHDOG_STATE:-$CFST_DIR/.publish_watchdog_state}"
 APPLY_STATE_FILE="${WATCHDOG_APPLY_STATE:-${APPLY_STATE:-$CFST_DIR/.apply_state}}"
 BEST_FILE="${WATCHDOG_BEST_FILE:-${BEST:-$CFST_DIR/best_ips.txt}}"
@@ -64,12 +66,20 @@ else
 fi
 
 # ── 信号 1：发布状态分歧持续时长 ────────────────────────────────────
-new_state=$(compute_apply_state 2>/dev/null || true)
+new_state=""
+members=""
+if targets=$(read_publish_targets 2>/dev/null); then
+  preferred=${targets%%$'\n'*}
+  members=${targets#*$'\n'}
+  new_state=$(compute_apply_state "$preferred" "$members" 2>/dev/null || true)
+fi
 cur_state=""
-[ -f "$APPLY_STATE_FILE" ] && cur_state=$(cat "$APPLY_STATE_FILE" 2>/dev/null || true)
+if [ -f "$APPLY_STATE_FILE" ] && [ ! -e "$APPLY_STATE_FILE.pending" ]; then
+  cur_state=$(cat "$APPLY_STATE_FILE" 2>/dev/null || true)
+fi
 
 if [ -z "$new_state" ]; then
-  alerts+=("[cfst-watchdog] compute_apply_state 失败；发布健康度未知（config.sh / push_to_misub.py / best_ips 是否可读？）")
+  alerts+=("[cfst-watchdog] compute_apply_state 失败;发布健康度未知(检查发布快照与模板配置)")
 elif [ "$new_state" = "$cur_state" ]; then
   # 已收敛：清除分歧计时，下次分歧重新起算
   rm -f "$STATE_FILE"
@@ -86,13 +96,23 @@ else
 
   age=$(( now - first_seen ))
   if (( age > PUBLISH_STALE_HOURS * 3600 )) && (( now - last_alert >= ALERT_REPEAT_HOURS * 3600 )); then
-    alerts+=("[cfst-watchdog] 发布停摆：待发布变更已 $(( age / 3600 ))h 未落地 MiSub（阈值 ${PUBLISH_STALE_HOURS}h）")
-    desired=$(publish_set 2>/dev/null | tr '\n' ' ' || true)
+    case "$PUBLISH_MODE" in
+      dns) target="DNS 记录集" ;;
+      both) target="DNS 记录集 + MiSub" ;;
+      *) target="MiSub" ;;
+    esac
+    alerts+=("[cfst-watchdog] 发布停摆：待发布变更已 $(( age / 3600 ))h 未落地 $target（阈值 ${PUBLISH_STALE_HOURS}h）")
+    desired=${members//$'\n'/ }
     [ -n "${desired// /}" ] && alerts+=("  应发布 Top${PUBLISH_TOP_N}: ${desired% }")
     if [ -f "$CFST_DIR/.push_disabled" ]; then
       alerts+=("  原因线索: 存在 .push_disabled（维护闸门未摘除）")
     fi
-    last_fail=$(grep -aE 'apply: (all pushes failed|push_to_misub failed)' "$RESULT_DIR/cron.log" 2>/dev/null | tail -n1 || true)
+    case "$PUBLISH_MODE" in
+      dns) fail_pattern='apply: DNS publish failed|did not resolve to the published set' ;;
+      both) fail_pattern='apply: DNS publish failed|did not resolve to the published set|apply: (push_to_misub failed|publish incomplete|all pushes failed)' ;;
+      *) fail_pattern='apply: (all pushes failed|push_to_misub failed|publish incomplete)' ;;
+    esac
+    last_fail=$(grep -aE "$fail_pattern" "$RESULT_DIR/cron.log" 2>/dev/null | tail -n1 || true)
     [ -n "$last_fail" ] && alerts+=("  最近失败行: $last_fail")
     last_alert="$now"
   fi

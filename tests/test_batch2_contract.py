@@ -35,7 +35,7 @@ def _verify_sandbox(
     history = sandbox / history_name
     history.write_text("", encoding="utf-8")
     secret = sandbox / "vless.env"
-    secret.write_text("VLESS_UUID=00000000-0000-0000-0000-000000000001\n", encoding="utf-8")
+    secret.write_text("VLESS_UUID=00000000-0000-4000-8000-000000000001\n", encoding="utf-8")
     secret.chmod(0o600)
     input_file = sandbox / "ips.txt"
     input_file.write_text("1.1.1.1\n", encoding="utf-8")
@@ -61,6 +61,9 @@ declare -A NODE_SG=( [host]="example.invalid" [path]="/test" [uuid]="$VLESS_UUID
     )
     shutil.copy2(ROOT / "verify_vless.sh", sandbox / "vcheck.sh")
     shutil.copy2(ROOT / "ip_validation.py", sandbox / "ip_validation.py")
+    shutil.copy2(ROOT / "vless_template.py", sandbox / "vless_template.py")
+    shutil.copy2(ROOT / "quality_evidence.py", sandbox / "quality_evidence.py")
+    shutil.copy2(ROOT / "atomic_io.py", sandbox / "atomic_io.py")
     (sandbox / "vcheck.sh").chmod(
         (sandbox / "vcheck.sh").stat().st_mode | stat.S_IXUSR
     )
@@ -93,6 +96,8 @@ exit "${FAKE_CURL_RC:-0}"
     env["FAKE_TIME_ROWS"] = time_rows
     env["FAKE_HTTP_ROWS"] = http_rows
     env["FAKE_CURL_RC"] = str(curl_rc)
+    if http_rows.startswith("0\t"):
+        env["VLESS_REFERENCE_OUT"] = str(sandbox / "ref.txt")
     proc = subprocess.run(
         [str(sandbox / "vcheck.sh"), "--audit", str(input_file)],
         cwd=sandbox,
@@ -103,6 +108,24 @@ exit "${FAKE_CURL_RC:-0}"
         check=False,
     )
     return sandbox, proc, history
+
+
+def test_verify_records_structured_audit_without_changing_the_summary(tmp_path: Path) -> None:
+    from datetime import datetime
+    from quality_evidence import load_batches
+
+    sandbox, proc, history = _verify_sandbox(
+        tmp_path, tries=3, time_rows="",
+        http_rows="0\t200\t0.440\t0\n1\t200\t0.050\t0\n2\t000\t0\t28\n3\t200\t0.065\t0\n",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "PARTIAL 58" in proc.stdout
+    key, run = (sandbox / "ref.txt").read_text().splitlines()
+    [batch] = load_batches(history.with_suffix(history.suffix + ".requests.jsonl"), datetime.now(), key)
+    assert batch.run == run
+    assert [(r.state, r.ttfb) for r in batch.requests] == [
+        ("ok", 440), ("ok", 50), ("timeout", None), ("ok", 65),
+    ]
 
 
 def test_verify_even_samples_use_arithmetic_median(tmp_path: Path) -> None:

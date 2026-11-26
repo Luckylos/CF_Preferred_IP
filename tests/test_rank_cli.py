@@ -19,8 +19,21 @@ NOW = "2026-10-15 16:10:00"
 
 
 def run_rank(args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([sys.executable, str(ROOT / "rank.py"), *args],
+    # Exercise the historical policy against archived fixtures without opening
+    # a writable TSV entry point in the rank command.
+    command = "import rank; raise SystemExit(rank._run_cli(rank.build_parser().parse_args()))"
+    return subprocess.run([sys.executable, "-c", command, *args], cwd=ROOT,
                           capture_output=True, text=True)
+
+
+def test_history_only_cli_refuses_write_mode(tmp_path):
+    env = make_env(tmp_path)
+    before = {path: path.read_bytes() for path in tmp_path.iterdir() if path.is_file()}
+    result = subprocess.run([sys.executable, str(ROOT / "rank.py"), *base_args(env)],
+                            capture_output=True, text=True)
+    assert result.returncode == 2
+    assert "--observations is required" in result.stderr
+    assert {path: path.read_bytes() for path in tmp_path.iterdir() if path.is_file()} == before
 
 
 def summary_of(out: str) -> dict[str, str]:
@@ -253,15 +266,25 @@ def test_auto_systemic_round_escalates_guard(tmp_path: Path) -> None:
 
 # ── 回放 ────────────────────────────────────────────────────────────────
 
-def test_replay_fixture_is_deterministic() -> None:
-    cfg = rank.Config()
-    a = replay.replay(FIXTURE, days=5, cfg=cfg)
-    b = replay.replay(FIXTURE, days=5, cfg=cfg)
-    assert a == b
-    assert len(a.days) == 5
-    assert all(len(d.top3) <= 3 for d in a.days)
-    assert a.changes == sum(1 for i in range(1, 5) if a.days[i].top3 != a.days[i - 1].top3)
-    r = subprocess.run([sys.executable, str(ROOT / "replay.py"), "--history", str(FIXTURE), "--days", "5"],
+def test_replay_fixture_is_deterministic_and_read_only(tmp_path) -> None:
+    from quality_evidence import Batch, Request, store_batches
+
+    observations = tmp_path / "requests.jsonl"
+    now = rank.parse_ts("2026-11-26 23:00:00")
+    reference = "a" * 64
+    rows = [Batch(now, "current", reference, "192.0.2.1", (Request("ok", 45),) * 2),
+            Batch(now, "other", "b" * 64, "192.0.2.2", (Request("ok", 45),) * 2)]
+    store_batches(observations, rows, now)
+    before = observations.read_bytes()
+    args = (observations, reference, 1, rank.Config(), now)
+    result = replay.replay(*args)
+    assert result == replay.replay(*args)
+    assert result[0].quality == {"192.0.2.1": "pending"}
+    assert result[0].strength == ["192.0.2.1"]
+    r = subprocess.run([sys.executable, str(ROOT / "replay.py"), "--observations", str(observations),
+                        "--reference", reference, "--now", "2026-11-26 23:00:00"],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
-    assert r.stdout.rstrip().splitlines()[-1].startswith("replay: days=5 changes=")
+    assert "historical_guard=unreconstructable" in r.stdout
+    assert observations.read_bytes() == before
+    assert sorted(tmp_path.iterdir()) == [observations]

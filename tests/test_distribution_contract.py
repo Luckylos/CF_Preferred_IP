@@ -11,6 +11,7 @@ fail loudly if a future sync reintroduces something that must never be public:
 
 from __future__ import annotations
 
+import ast
 import ipaddress
 import re
 from pathlib import Path
@@ -22,6 +23,11 @@ REQUIRED_FILES = [
     "config.sh",
     "cycle.sh",
     "cycle_result.py",
+    "audit_evidence.py",
+    "quality_evidence.py",
+    "publication_snapshot.py",
+    "dns_publish.py",
+    "vless_template.py",
     "rank.py",
     "admission.py",
     "cooldown.py",
@@ -37,6 +43,15 @@ REQUIRED_FILES = [
 
 RUNTIME_STATE_NAMES = {
     "secrets",
+    "backups",
+    ".env",
+    ".publish_desired.json",
+    ".dns_preference.json",
+    ".quality_evidence_enabled",
+    ".misub-reconcile-pending.json",
+    ".apply_state.pending",
+    "contenders.tsv.lifecycle.json",
+    "vless_history.tsv.requests.jsonl",
     ".hermes",
     "results",
     ".tiers",
@@ -98,11 +113,26 @@ def test_publication_contains_no_literal_credentials():
 
 def test_relay_endpoints_are_placeholders():
     config = (ROOT / "config.sh").read_text(encoding="utf-8")
-    for key in ("HK", "SG"):
+    for key in ("HK", "HT", "SG"):
         for field in ("SNI", "HOST"):
             match = re.search(rf'^CFST_TEMPLATE_{key}_{field}="([^"]+)"', config, re.M)
             assert match, f"{key}_{field}"
             assert match.group(1).endswith("example.com"), f"{key}_{field}"
+
+
+def test_publication_adapter_defaults_are_placeholders():
+    for filename, expected in (
+        ("dns_publish.py", {"RECORD_NAME": "preferred.example.com", "ZONE_ID": "0" * 32}),
+        ("push_to_misub.py", {"MISUB_BASE": "https://subscription.example.com/api/ext/v1"}),
+    ):
+        source = ast.parse((ROOT / filename).read_text(encoding="utf-8"))
+        defaults = {
+            node.targets[0].id: ast.literal_eval(node.value)
+            for node in source.body
+            if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in expected
+        }
+        assert defaults == expected
 
 
 def test_replay_fixture_holds_only_documentation_or_private_addresses():

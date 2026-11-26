@@ -676,7 +676,9 @@ def main(argv=None) -> int:
     audit.add_argument("--percent", type=int, default=80)
     rank = sub.add_parser("receipt")
     rank.add_argument("--path", type=Path, required=True)
-    rank.add_argument("--published", action="store_true")
+    field = rank.add_mutually_exclusive_group()
+    field.add_argument("--published", action="store_true")
+    field.add_argument("--guard", action="store_true")
     finish = sub.add_parser("finish")
     finish.add_argument("--record", type=Path, required=True)
     finish.add_argument("--rank-receipt", type=Path)
@@ -708,7 +710,12 @@ def main(argv=None) -> int:
         print(e.returned, e.minimum, e.guard)
     elif args.action == "receipt":
         value = read_rank_receipt(args.path)
-        print(" ".join(value.published) if args.published else value.summary())
+        if args.published:
+            print(" ".join(value.published))
+        elif args.guard:
+            print(value.guard)
+        else:
+            print(value.summary())
     else:
         r = (
             read_rank_receipt(args.rank_receipt)

@@ -69,5 +69,5 @@ def test_receipt_write_error_is_not_success(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cr, "atomic_write", fail)
     with pytest.raises(OSError):
-        rank.main(base_args(env) + ["--result-out", str(out)])
+        rank._run_cli(rank.build_parser().parse_args(base_args(env) + ["--result-out", str(out)]))
     assert not out.exists()

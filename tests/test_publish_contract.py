@@ -120,14 +120,20 @@ class CandidateVerificationScopeTests(unittest.TestCase):
 class StateBehaviourTests(unittest.TestCase):
     """真正的验收：在沙箱里调用共用函数，逐维度证明状态键的敏感度。"""
 
-    TOP5 = ["1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4", "5.5.5.5"]
+    TOP5 = ["1.1.1.1", "192.0.2.2", "192.0.2.3", "192.0.2.4", "192.0.2.5"]
 
     def _sandbox(self, tmp: pathlib.Path, ips: list[str], template: str = "v1",
                  secret: str = "MISUB_TOKEN=deadbeef") -> None:
+        from shutil import copy2
+        from publication_snapshot import migrate
+
         best = tmp / "best_ips.txt"
+        for name in ("publication_snapshot.py", "atomic_io.py", "dns_selection.py", "ip_validation.py"):
+            copy2(CFST_DIR / name, tmp)
         best.write_text(
             "# scored\n# --- BEST_IPS (machine-readable) ---\n" + "\n".join(ips) + "\n"
         )
+        migrate(best, 3)
         (tmp / "push_to_misub.py").write_text(f"# template {template}\n")
         secrets = tmp / "secrets"
         secrets.mkdir(exist_ok=True)
@@ -170,21 +176,19 @@ compute_apply_state
 
     def test_publish_set_change_changes_state(self) -> None:
         base = self._state(self.TOP5)
-        moved = self._state(["9.9.9.9", "2.2.2.2", "3.3.3.3", "4.4.4.4", "5.5.5.5"])
+        moved = self._state(["9.9.9.9", *self.TOP5[1:]])
         self.assertNotEqual(base, moved, "发布位 IP 变化必须触发推送")
 
     def test_publish_set_reorder_changes_state(self) -> None:
         """rank1/2/3 映射到 CM/CM2/CM3，顺序本身就是契约。"""
         base = self._state(self.TOP5)
-        swapped = self._state(["2.2.2.2", "1.1.1.1", "3.3.3.3", "4.4.4.4", "5.5.5.5"])
+        swapped = self._state([self.TOP5[1], self.TOP5[0], *self.TOP5[2:]])
         self.assertNotEqual(base, swapped, "发布位顺序变化必须触发推送")
 
     def test_candidate_only_change_does_not_change_state(self) -> None:
         """P3.1 的核心：rank4/rank5 变化不得触发生产重推。"""
         base = self._state(self.TOP5)
-        candidates_moved = self._state(
-            ["1.1.1.1", "2.2.2.2", "3.3.3.3", "8.8.8.8", "7.7.7.7"]
-        )
+        candidates_moved = self._state([*self.TOP5[:3], "8.8.8.8", "192.0.2.6"])
         self.assertEqual(
             base,
             candidates_moved,
@@ -194,7 +198,7 @@ compute_apply_state
     def test_candidate_count_change_does_not_change_state(self) -> None:
         """候补集缩短/延长同样不影响发布集。"""
         base = self._state(self.TOP5)
-        fewer = self._state(["1.1.1.1", "2.2.2.2", "3.3.3.3"])
+        fewer = self._state(self.TOP5[:3])
         self.assertEqual(base, fewer, "候补集数量变化不得触发推送")
 
     def test_template_change_changes_state(self) -> None:

@@ -9,14 +9,12 @@ source "$(dirname "$0")/config.sh"
 cd "$CFST_DIR"
 
 # ── 读取当前 Top1 ──
-TOP1=$(sed -n '/^# --- BEST_IPS/,$ { /^[0-9]/ {p;q} }' "$BEST" 2>/dev/null || true)
-if [ -z "$TOP1" ]; then
+if ! targets=$(read_publish_targets); then
+  echo "[$(date '+%F %T')] watchdog: publication target unavailable; skipping health check" >&2
   exit 0
 fi
-if ! TOP1=$(printf '%s\n' "$TOP1" | python3 "$CFST_DIR/ip_validation.py" --strict); then
-  echo "[$(date '+%F %T')] watchdog: invalid Top1 IPv4; skipping health check" >&2
-  exit 0
-fi
+mapfile -t candidates <<< "$targets"
+TOP1=${candidates[0]:-${candidates[1]}}
 
 # ── TCP 连通性检测（443 端口，3 秒超时）──
 check_tcp() {

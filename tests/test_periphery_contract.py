@@ -74,7 +74,8 @@ def _watchdog_sandbox(tmp_path: Path, cycle_body: str, *, disabled: bool = False
     (sb / "contenders.tsv").write_text("# contenders.tsv\n1.1.1.1\tx\tx\tmaster\n", encoding="utf-8")
     (sb / "config.sh").write_text(
         f'CFST_DIR={sb}\nBEST="$CFST_DIR/best_ips.txt"\nWATCHDOG_STATE="$CFST_DIR/.watchdog_state"\n'
-        'WATCHDOG_MISS_THRESHOLD=1\nWATCHDOG_COOLDOWN=3600\n', encoding="utf-8")
+        'WATCHDOG_MISS_THRESHOLD=1\nWATCHDOG_COOLDOWN=3600\n'
+        "read_publish_targets() { printf '%s\\n' '' 1.1.1.1; }\n", encoding="utf-8")
     for name in ("watchdog.sh", "ip_validation.py"):
         (sb / name).write_bytes((ROOT / name).read_bytes())
     (sb / "watchdog.sh").chmod(0o755)

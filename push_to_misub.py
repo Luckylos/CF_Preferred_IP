@@ -52,15 +52,15 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, NotRequired, TypedDict
+from typing import Any, NotRequired, Protocol, TypedDict
 
 from ip_validation import is_valid_ipv4
 
-MISUB_BASE = "https://example.com/api/ext/v1"
+MISUB_BASE = "https://subscription.example.com/api/ext/v1"
 DEFAULT_MISUB_TOKEN_FILE = "/opt/cfst/secrets/misub.env"
 BEST_IPS_FILE = "/opt/cfst/best_ips.txt"
 PENDING_RECONCILE_FILE = Path(
@@ -72,8 +72,8 @@ PENDING_RECONCILE_FILE = Path(
 VERIFY_SCRIPT = Path(__file__).with_name("verify_vless.sh")
 TOP_N = 3
 CFST_NODE_SUFFIXES = {"CM", "CM2", "CM3"}
-CFST_NODE_PREFIXES = {"🇭🇰 HK Senior", "🇸🇬 SG Legend"}
-PROFILE_NAME = "LeGend"
+CFST_NODE_PREFIXES = {"🇭🇰 HK Example", "🇸🇬 SG Example"}
+PROFILE_NAME = "CFST Example"
 API_ATTEMPTS = 3
 API_TIMEOUT_SECONDS = 30
 VERIFY_TIMEOUT_SECONDS = 180
@@ -95,6 +95,8 @@ CONFIG_FILE = Path(
 class Region(TypedDict):
     prefix: str
     key: str
+    query: str
+    audit_key: str
     sni: str
     host: str
     path: str
@@ -103,9 +105,13 @@ class Region(TypedDict):
     legacy_insecure_flags: NotRequired[bool]
 
 
+# QUERY is the subscription URL parameter string: pushing only substitutes the IP.
+# AUDIT_KEY names the template whose NODE_* values verify_vless.sh probes with.
 _TEMPLATE_FIELDS = (
     "KEY",
     "NAME_PREFIX",
+    "QUERY",
+    "AUDIT_KEY",
     "SNI",
     "HOST",
     "PATH",
@@ -114,7 +120,7 @@ _TEMPLATE_FIELDS = (
     "LEGACY_INSECURE_FLAGS",
 )
 _TEMPLATE_ASSIGNMENT = re.compile(
-    r"^\s*(CFST_TEMPLATE_(?:HK|SG)_(?:KEY|NAME_PREFIX|SNI|HOST|PATH|FP|ALPN|LEGACY_INSECURE_FLAGS))\s*=(.*)$"
+    r"^\s*(CFST_TEMPLATE_(?:HK|SG|HT)_(?:KEY|NAME_PREFIX|QUERY|AUDIT_KEY|SNI|HOST|PATH|FP|ALPN|LEGACY_INSECURE_FLAGS))\s*=(.*)$"
 )
 
 
@@ -163,7 +169,7 @@ def _read_template_values() -> dict[str, str]:
 def _load_template_regions() -> list[Region]:
     values = _read_template_values()
     regions: list[Region] = []
-    for key in ("HK", "SG"):
+    for key in ("HK", "SG", "HT"):
         prefix = f"CFST_TEMPLATE_{key}_"
         missing = [field for field in _TEMPLATE_FIELDS if f"{prefix}{field}" not in values]
         if missing:
@@ -174,6 +180,8 @@ def _load_template_regions() -> list[Region]:
         if template_key != key:
             raise RuntimeError(f"template config key mismatch for {key}: {CONFIG_FILE}")
         name_prefix = values[f"{prefix}NAME_PREFIX"]
+        query = values[f"{prefix}QUERY"]
+        audit_key = values[f"{prefix}AUDIT_KEY"]
         sni = values[f"{prefix}SNI"]
         host = values[f"{prefix}HOST"]
         path = values[f"{prefix}PATH"]
@@ -182,6 +190,14 @@ def _load_template_regions() -> list[Region]:
         legacy = values[f"{prefix}LEGACY_INSECURE_FLAGS"]
         if not name_prefix or any(char in name_prefix for char in "\r\n"):
             raise RuntimeError(f"template config has invalid {prefix}NAME_PREFIX: {CONFIG_FILE}")
+        if not query or any(char.isspace() for char in query) or any(
+            char in query for char in "#?"
+        ):
+            raise RuntimeError(f"template config has invalid {prefix}QUERY: {CONFIG_FILE}")
+        if "type=" not in query:
+            raise RuntimeError(f"template config has invalid {prefix}QUERY: {CONFIG_FILE}")
+        if audit_key not in {"HK", "SG", "HT"}:
+            raise RuntimeError(f"template config has invalid {prefix}AUDIT_KEY: {CONFIG_FILE}")
         if not re.fullmatch(r"[A-Za-z0-9.-]+", sni) or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
             raise RuntimeError(f"template config has invalid {prefix}SNI/HOST: {CONFIG_FILE}")
         if not path.startswith("/") or any(char in path for char in "\r\n"):
@@ -196,6 +212,8 @@ def _load_template_regions() -> list[Region]:
         region: Region = {
             "prefix": name_prefix,
             "key": template_key,
+            "query": query,
+            "audit_key": audit_key,
             "sni": sni,
             "host": host,
             "path": path,
@@ -401,26 +419,60 @@ def read_best_ips() -> list[str]:
     return ips[:TOP_N]
 
 
+_HOSTNAME = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$")
+
+
+def node_address(target: str) -> str:
+    """节点地址既可以是优选 IP，也可以是稳定域名（DNS 只做指针）。"""
+    if is_valid_ipv4(target):
+        return target
+    if _HOSTNAME.match(target):
+        return target
+    raise RuntimeError(f"invalid node address: {target!r}")
+
+
+def swap_address(url: str, address: str) -> str:
+    """只替换节点地址：凭据、传输参数、显示名全部保留。
+
+    这些字段属于 MiSub 里那个节点；重建整条 URL 会覆盖它（HT 的 uuid 就与 HK/SG 不同）。
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "vless" or not parts.username or not parts.hostname:
+        raise RuntimeError(f"cannot read a vless node url: {url!r}")
+    netloc = f"{parts.username}@{node_address(address)}"
+    if parts.port:
+        netloc += f":{parts.port}"
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+def node_connection(url: str) -> tuple[str, str]:
+    """(query, uuid) —— 用来按节点自己的凭据做 preflight。"""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "vless" or not parts.username:
+        raise RuntimeError(f"node url carries no vless credential: {url!r}")
+    return parts.query, parts.username
+
+
+def region_connection(region: Mapping[str, Any], managed: Mapping[str, "ManagedNode"]) -> tuple[str, str] | None:
+    """该地区现有节点里的凭据；一个都没有时返回 None（交给模板兜底用于新建）。"""
+    for suffix in SUFFIXES:
+        node = managed.get(f"{region['prefix']} {suffix}")
+        if node is not None:
+            return node_connection(node.url)
+    return None
+
+
+def expected_managed_names() -> set[str]:
+    return {f"{region['prefix']} {suffix}" for region in REGIONS for suffix in SUFFIXES}
+
+
 def build_vless_url(region: Mapping[str, Any], ip: str, suffix: str) -> str:
-    if not is_valid_ipv4(ip):
-        raise RuntimeError(f"invalid IPv4: {ip!r}")
-    params = {
-        "encryption": "none",
-        "security": "tls",
-        "sni": region["sni"],
-        "fp": region["fp"],
-        "type": "ws",
-        "host": region["host"],
-        "path": region["path"],
-    }
-    if region.get("legacy_insecure_flags"):
-        params["insecure"] = "0"
-        params["allowInsecure"] = "0"
-    if region["alpn"]:
-        params["alpn"] = region["alpn"]
-    query = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+    address = node_address(ip)
+    query = region["query"]
+    if not query or any(char.isspace() for char in query):
+        raise RuntimeError(f"invalid vless query for region {region['key']}: {query!r}")
     name = f"{region['prefix']} {suffix}"
-    return f"vless://{get_vless_uuid()}@{ip}:443?{query}#{urllib.parse.quote(name)}"
+    return f"vless://{get_vless_uuid()}@{address}:443?{query}#{urllib.parse.quote(name)}"
 
 
 def parse_audit_results(output: str, expected_ips: list[str]) -> dict[str, AuditResult]:
@@ -471,15 +523,21 @@ def assert_region_preflight_passed(
 
 
 def _run_region_audit(
-    region: Region, ips: list[str], temp_path: Path, attempt: str
+    region: Region, ips: list[str], temp_path: Path, attempt: str,
+    *, query: str | None = None, uuid: str | None = None,
 ) -> tuple[dict[str, AuditResult], bool]:
     """Run one isolated verifier invocation without touching production history."""
     input_path = temp_path / f"ips-{attempt}.txt"
     history_path = temp_path / f"history-{attempt}.tsv"
     input_path.write_text("\n".join(ips) + "\n", encoding="utf-8")
     env = os.environ.copy()
-    env["VLESS_TEMPLATE"] = str(region["key"])
+    env["VLESS_TEMPLATE"] = str(region.get("audit_key") or region["key"])
     env["VLESS_HISTORY"] = str(history_path)
+    # 用节点自己的凭据/参数探测：HT 那条隧道用的是另一个 uuid。
+    if query:
+        env["VLESS_TEMPLATE_QUERY"] = query
+    if uuid:
+        env["VLESS_TEMPLATE_UUID"] = uuid
     try:
         completed = subprocess.run(
             [str(VERIFY_SCRIPT), "--audit", str(input_path)],
@@ -500,13 +558,21 @@ def _run_region_audit(
             for ip in ips
         }, False
 
+    # 75 = 验证器正被其它周期占用。这不是候选 IP 的失败证据，不能记成 FAIL，
+    # 也不能把整轮推送判死；交给下一轮重试即可。
+    if completed.returncode == 75:
+        raise RuntimeError(
+            f"VLESS verifier busy (rc=75); deferring preflight for {region.get('key')}"
+        )
+
     output = f"{completed.stdout or ''}\n{completed.stderr or ''}"
     results = parse_audit_results(output, ips)
     return results, completed.returncode == 0
 
 
-def run_region_preflight(region: Region, ips: list[str]) -> None:
-    """Verify every candidate with the exact template used for its new nodes."""
+def run_region_preflight(region: Region, ips: list[str], *,
+                         query: str | None = None, uuid: str | None = None) -> None:
+    """Verify every candidate with the exact credentials/params the node uses."""
     if not VERIFY_SCRIPT.is_file():
         raise RuntimeError(f"VLESS verifier is unavailable: {VERIFY_SCRIPT}")
 
@@ -514,7 +580,7 @@ def run_region_preflight(region: Region, ips: list[str]) -> None:
         temp_path = Path(temp_dir)
         region_key = str(region["key"])
         initial_results, initial_ok = _run_region_audit(
-            region, ips, temp_path, "initial"
+            region, ips, temp_path, "initial", query=query, uuid=uuid
         )
         failed = (
             ips
@@ -535,7 +601,8 @@ def run_region_preflight(region: Region, ips: list[str]) -> None:
             recovery_ok: list[bool] = []
             for attempt in range(1, PREFLIGHT_RECOVERY_ATTEMPTS + 1):
                 results, command_ok = _run_region_audit(
-                    region, [ip], temp_path, f"recovery-{index}-{attempt}"
+                    region, [ip], temp_path, f"recovery-{index}-{attempt}",
+                    query=query, uuid=uuid,
                 )
                 result = results[ip]
                 recovery_results.append(result)
@@ -571,29 +638,6 @@ def is_managed_name(name: str) -> bool:
     return prefix in CFST_NODE_PREFIXES and suffix in CFST_NODE_SUFFIXES
 
 
-def list_managed_nodes() -> list[ManagedNode]:
-    response = require_success(api_request("GET", "/manual-nodes?pageSize=200"), "list manual nodes")
-    data = response.get("data")
-    if not isinstance(data, list):
-        raise RuntimeError("manual-nodes response data is not a list")
-    result: list[ManagedNode] = []
-    for node in data:
-        if not isinstance(node, dict):
-            continue
-        name, node_id, url = str(node.get("name", "")), node.get("id"), node.get("url")
-        if is_managed_name(name) and isinstance(node_id, str) and isinstance(url, str):
-            result.append(ManagedNode(node_id, name, url))
-    return result
-
-
-def list_profiles() -> list[dict[str, Any]]:
-    response = require_success(api_request("GET", "/profiles"), "list profiles")
-    profiles = response.get("data")
-    if not isinstance(profiles, list) or not all(isinstance(profile, dict) for profile in profiles):
-        raise RuntimeError("profiles response data is not a list of objects")
-    return profiles
-
-
 def find_profile(profiles: list[dict[str, Any]]) -> dict[str, Any]:
     matches = [profile for profile in profiles if profile.get("name") == PROFILE_NAME]
     if len(matches) != 1:
@@ -606,138 +650,6 @@ def profile_node_ids(profile: dict[str, Any]) -> list[str]:
     if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
         raise RuntimeError(f"profile {profile.get('name', '<unknown>')} manualNodeIds is invalid")
     return values
-
-
-def other_profile_refs(
-    profiles: list[dict[str, Any]], target_profile: dict[str, Any], old_managed_ids: set[str]
-) -> dict[str, set[str]]:
-    """Find managed nodes referenced by other profiles using fresh profile reads.
-
-    The collection returned by ``GET /profiles`` is only a discovery snapshot.
-    Each foreign profile is read again by id before a node can be reclaimed. Any
-    failed or malformed fresh read is an unknown safety condition, not evidence
-    that the profile has no references.
-    """
-    target_id = target_profile.get("id")
-    refs: dict[str, set[str]] = {}
-    for profile in profiles:
-        profile_id = profile.get("id")
-        if profile_id == target_id:
-            continue
-        if not isinstance(profile_id, str) or not profile_id:
-            raise RuntimeError("foreign profile has no valid id; refusing to reclaim")
-        try:
-            ids = set(get_profile_refs(profile_id)) & old_managed_ids
-        except Exception as exc:
-            raise RuntimeError(
-                f"could not fresh-read other profile {profile_id}; refusing to reclaim"
-            ) from exc
-        if ids:
-            name = str(profile.get("name") or profile_id)
-            refs[name] = ids
-    return refs
-
-
-def lookup_manual_node(node_id: str) -> NodeLookup:
-    """Return an explicit FOUND, MISSING, or UNKNOWN per-id read outcome."""
-    response = api_request("GET", f"/manual-nodes/{node_id}")
-    if response is None:
-        return NodeLookup(NodeLookupState.UNKNOWN, reason="API read failed or was exhausted")
-    if response.get("success") is not True:
-        error = response.get("error")
-        status = error.get("status") if isinstance(error, dict) else None
-        if status == 404:
-            return NodeLookup(NodeLookupState.MISSING, reason="authoritative HTTP 404")
-        return NodeLookup(NodeLookupState.UNKNOWN, reason=f"API read returned status {status!r}")
-    node = response.get("data")
-    if not isinstance(node, dict):
-        return NodeLookup(NodeLookupState.UNKNOWN, reason="API read returned invalid node data")
-    found_id, name, url = node.get("id"), node.get("name"), node.get("url")
-    if not (isinstance(found_id, str) and isinstance(name, str) and isinstance(url, str)):
-        return NodeLookup(NodeLookupState.UNKNOWN, reason="API read returned malformed node data")
-    if found_id != node_id:
-        return NodeLookup(NodeLookupState.UNKNOWN, reason="API read returned a different node id")
-    return NodeLookup(NodeLookupState.FOUND, ManagedNode(found_id, name, url))
-
-
-def get_manual_node(node_id: str) -> ManagedNode | None:
-    """Read one node by id, raising when absence is not authoritative.
-
-    Upstream getManualNodeById() issues direct SQL, so a per-id read is always
-    fresh. Collection reads (GET /manual-nodes) go through the 30s TTL cache and
-    must never be used as verification evidence. ``None`` now means only an
-    authoritative HTTP 404; all other failures raise ``UnknownNodeLookup``.
-    """
-    outcome = lookup_manual_node(node_id)
-    if outcome.state is NodeLookupState.FOUND:
-        assert outcome.node is not None
-        return outcome.node
-    if outcome.state is NodeLookupState.MISSING:
-        return None
-    raise UnknownNodeLookup(f"manual node {node_id} lookup UNKNOWN: {outcome.reason}")
-
-
-def resolve_nodes_by_id(node_ids: list[str]) -> NodeResolution:
-    """Resolve ids without turning an uncertain read into a missing node."""
-    found: dict[str, ManagedNode] = {}
-    missing: set[str] = set()
-    unknown: dict[str, str] = {}
-    for node_id in node_ids:
-        try:
-            node = get_manual_node(node_id)
-        except UnknownNodeLookup as exc:
-            unknown[node_id] = str(exc)
-            continue
-        if node is None:
-            missing.add(node_id)
-        else:
-            found[node_id] = node
-    return NodeResolution(found=found, missing=missing, unknown=unknown)
-
-
-def get_profile_refs(profile_id: str) -> list[str]:
-    """Read a profile's manual node references.
-
-    Upstream getProfileById() issues direct SQL, so this is fresh even when a
-    cached GET /profiles list would still show a pre-write snapshot.
-    """
-    response = require_success(
-        api_request("GET", f"/profiles/{profile_id}"), f"read profile {profile_id}"
-    )
-    data = response.get("data")
-    if not isinstance(data, dict):
-        raise RuntimeError(f"profile {profile_id} response data is not an object")
-    return profile_node_ids(data)
-
-
-def create_managed_node(name: str, url: str) -> ManagedNode:
-    response = require_success(
-        api_request("POST", "/manual-nodes", {"name": name, "url": url}),
-        f"create {name}",
-    )
-    node = response.get("data")
-    if not isinstance(node, dict) or not isinstance(node.get("id"), str):
-        raise RuntimeError(f"create {name} returned no node id")
-    return ManagedNode(node["id"], name, str(node.get("url", "")))
-
-
-def update_managed_node_url(node: ManagedNode, url: str) -> ManagedNode:
-    """Update a node's URL in place.
-
-    This is the route that makes the whole design safe: upstream
-    PATCH /manual-nodes/:id reads the node by id and writes only that
-    subscription row. It never calls putProfile(), so it cannot revert a profile
-    reference no matter which isolate serves it or how stale that isolate's
-    cached collections are.
-    """
-    response = require_success(
-        api_request("PATCH", f"/manual-nodes/{node.id}", {"url": url}),
-        f"update {node.name}",
-    )
-    data = response.get("data")
-    if not isinstance(data, dict) or data.get("url") != url:
-        raise RuntimeError(f"MiSub did not return the updated url for {node.name}")
-    return ManagedNode(node.id, node.name, url)
 
 
 def select_managed_by_name(
@@ -775,42 +687,6 @@ def select_managed_by_name(
     return keep, reclaim
 
 
-def delete_nodes(nodes: list[ManagedNode], phase: str) -> None:
-    for node in nodes:
-        response = api_request("DELETE", f"/manual-nodes/{node.id}")
-        if not response or response.get("success") is not True:
-            raise RuntimeError(f"{phase}: delete {node.name} failed")
-        print(f"  Deleted ({phase}): {node.name}")
-
-
-def wait_for_node_visibility(nodes: list[ManagedNode]) -> None:
-    """Block until every id resolves through a per-id read.
-
-    A newly created node can be acknowledged by POST before PATCH /profiles can
-    resolve it (02:03:42, HTTP 400 manual_node_id_not_found). Per-id reads are
-    used because they hit direct SQL; a cached collection read could report a
-    node as missing long after it exists, or as present after deletion.
-    """
-    pending = list(nodes)
-    for attempt in range(1, NODE_VISIBILITY_ATTEMPTS + 1):
-        pending = [node for node in pending if get_manual_node(node.id) is None]
-        if not pending:
-            if nodes:
-                print(f"  All {len(nodes)} new node(s) are visible")
-            return
-        if attempt < NODE_VISIBILITY_ATTEMPTS:
-            print(
-                f"  {len(pending)} new node(s) not visible yet; "
-                f"retrying ({attempt + 1}/{NODE_VISIBILITY_ATTEMPTS})",
-                file=sys.stderr,
-            )
-            time.sleep(NODE_VISIBILITY_DELAY_SECONDS)
-    raise RuntimeError(
-        f"new nodes are not visible via the MiSub API after "
-        f"{NODE_VISIBILITY_ATTEMPTS} attempts: {len(pending)} missing"
-    )
-
-
 def validate_replacement(nodes: list[ManagedNode]) -> None:
     expected_names = [f"{region['prefix']} {suffix}" for region in REGIONS for suffix in SUFFIXES]
     actual_names = [node.name for node in nodes]
@@ -828,18 +704,20 @@ def expected_managed_urls(ips: list[str]) -> dict[str, str]:
     }
 
 
-def _pending_reconcile_path() -> Path:
-    path = PENDING_RECONCILE_FILE
+def _pending_reconcile_path(path: Path | None = None) -> Path:
+    if path is None:
+        path = PENDING_RECONCILE_FILE
     if not isinstance(path, Path):
         raise TypeError("pending reconcile path is invalid")
     return path
 
 
 def write_pending_reconcile(
-    managed: dict[str, ManagedNode], desired_urls: dict[str, str], phase: str
+    managed: dict[str, ManagedNode], desired_urls: dict[str, str], phase: str,
+    *, path: Path | None = None,
 ) -> None:
     """Persist a secret-free marker before the first external mutation."""
-    path = _pending_reconcile_path()
+    path = _pending_reconcile_path(path)
     payload = {
         "version": 1,
         "phase": phase,
@@ -871,9 +749,9 @@ def write_pending_reconcile(
         raise
 
 
-def load_pending_reconcile() -> dict[str, Any] | None:
+def load_pending_reconcile(*, path: Path | None = None) -> dict[str, Any] | None:
     """Load and validate a prior incomplete reconcile marker."""
-    path = _pending_reconcile_path()
+    path = _pending_reconcile_path(path)
     if not path.exists():
         return None
     try:
@@ -896,9 +774,9 @@ def pending_reconcile_exists() -> bool:
     return load_pending_reconcile() is not None
 
 
-def clear_pending_reconcile() -> None:
+def clear_pending_reconcile(*, path: Path | None = None) -> None:
     """Remove the marker only after fresh final-state verification succeeds."""
-    path = _pending_reconcile_path()
+    path = _pending_reconcile_path(path)
     try:
         path.unlink()
     except FileNotFoundError:
@@ -907,219 +785,482 @@ def clear_pending_reconcile() -> None:
         raise RuntimeError(f"could not clear pending reconcile marker: {path}") from exc
 
 
-def bind_profile_refs(profile_id: str, manual_node_ids: list[str]) -> None:
-    """Write the profile reference set, then verify it with a fresh read.
+def expected_published_urls(host: str) -> dict[str, str]:
+    """所有受管理节点共用同一个发布入口；节点地址因此不再随 IP 变化。"""
+    return {f"{region['prefix']} {suffix}": build_vless_url(region, host, suffix)
+            for region in REGIONS for suffix in SUFFIXES}
 
-    Two failure modes are handled explicitly:
 
-    A stale subscriptions snapshot in the serving isolate makes upstream reject
-    brand-new ids with HTTP 400 manual_node_id_not_found (02:03:42). Retrying is
-    the correct response: the snapshot is at most 30s old, and a retry may also be
-    served by a different isolate. Every id is confirmed resolvable by a fresh
-    per-id read first, so a retry loop cannot mask a genuinely missing node.
+def _prepare_desired_urls(managed: Mapping[str, "ManagedNode"]) -> dict[str, str]:
+    """目标状态 = 每个受管节点指向某个优选 IP；其余一切沿用节点自己。
 
-    The value echoed back by PATCH is not accepted as proof, because it is built
-    from the request rather than re-read. Verification is a separate per-id read.
+    preflight 与最终 URL 都取自节点现有凭据，因此 CFST 不会把地区专属的 uuid
+    覆盖成全局默认值（HT 与 HK/SG 用的是不同 uuid）。
     """
-    missing = [
-        node_id for node_id in manual_node_ids if get_manual_node(node_id) is None
-    ]
-    if missing:
-        raise RuntimeError(
-            f"refusing to bind: {len(missing)} node id(s) do not resolve by id"
-        )
-
-    for attempt in range(1, BIND_ATTEMPTS + 1):
-        response = api_request(
-            "PATCH", f"/profiles/{profile_id}", {"manualNodeIds": manual_node_ids}
-        )
-        if response and response.get("success") is True:
-            observed = get_profile_refs(profile_id)
-            if observed == manual_node_ids:
-                return
-            reason = f"profile still shows {len(observed)} of {len(manual_node_ids)} refs"
-        else:
-            reason = "PATCH /profiles was rejected"
-        if attempt < BIND_ATTEMPTS:
-            print(
-                f"  bind attempt {attempt} failed ({reason}); "
-                f"retrying ({attempt + 1}/{BIND_ATTEMPTS})",
-                file=sys.stderr,
-            )
-            time.sleep(BIND_RETRY_DELAY_SECONDS)
-    raise RuntimeError(
-        f"could not bind {len(manual_node_ids)} profile refs after {BIND_ATTEMPTS} attempts"
-    )
-
-
-def verify_final_state(
-    profile_id: str, expected_profile_ids: list[str], managed: dict[str, ManagedNode],
-    desired_urls: dict[str, str],
-) -> None:
-    """Verify the outcome through fresh per-id reads only.
-
-    GET /manual-nodes and GET /profiles both serve the 30s TTL cached collection,
-    so they can report a pre-write snapshot and turn a real failure green. Only
-    per-id reads hit direct SQL, so only per-id reads are evidence.
-    """
-    final_refs = get_profile_refs(profile_id)
-    if final_refs != expected_profile_ids:
-        missing = [ref for ref in expected_profile_ids if ref not in final_refs]
-        extra = [ref for ref in final_refs if ref not in expected_profile_ids]
-        raise RuntimeError(
-            "profile references do not match the reconciled node set: "
-            f"missing={len(missing)} extra={len(extra)} "
-            f"order_match={final_refs == expected_profile_ids}"
-        )
-    for name, url in desired_urls.items():
-        node = get_manual_node(managed[name].id)
-        if node is None:
-            raise RuntimeError(f"managed node {name} does not resolve by id after reconcile")
-        if node.name != name or node.url != url:
-            raise RuntimeError(f"managed node {name} does not carry the current Top{TOP_N} url")
-
-
-def main() -> None:
-    print("=== MiSub CM Node Push (in-place reconcile) ===")
-    pending_record = load_pending_reconcile()
-    pending_written = pending_record is not None
-    pending_phase = pending_record.get("phase") if pending_record else None
-    if pending_written:
-        print(f"  Resuming a pending reconcile recorded at {_pending_reconcile_path()}")
-
-    def mark_pending(phase: str) -> None:
-        nonlocal pending_written
-        if pending_written:
-            return
-        write_pending_reconcile(managed, desired_urls, phase)
-        pending_written = True
-
     ips = read_best_ips()
     print(f"Top {TOP_N} IPs: {', '.join(ips)}")
 
-    print("\n[0/5] Verifying candidates with every CFST-managed region template...")
-    run_all_region_preflights(ips)
-    desired_urls = expected_managed_urls(ips)
+    credentials = {region["key"]: region_connection(region, managed) for region in REGIONS}
+    print("\n[0/5] Verifying candidates against each region's target entry...")
+    for region in REGIONS:
+        # 凭据取节点自己的（各隧道 uuid 不同）；入口参数取模板——那是我们要迁到的路径。
+        node_conn = credentials[region["key"]]
+        uuid = node_conn[1] if node_conn else get_vless_uuid()
+        if node_conn and node_conn[0] != region["query"]:
+            print(f"  {region['key']}: node parameters differ from the template; "
+                  "verifying the template entry (align the node to switch over)")
+        run_region_preflight(region, ips, query=region["query"], uuid=uuid)
 
-    print("\n[1/5] Reading current MiSub state...")
-    all_managed = list_managed_nodes()
-    profiles = list_profiles()
-    profile = find_profile(profiles)
-    profile_id = profile.get("id")
-    if not isinstance(profile_id, str):
-        raise RuntimeError("profile has no id")
+    desired: dict[str, str] = {}
+    for region in REGIONS:
+        for ip, suffix in zip(ips, SUFFIXES, strict=True):
+            name = f"{region['prefix']} {suffix}"
+            address = node_address(ip)
+            node = managed.get(name)
+            if node is not None:
+                # 节点自己的一切（凭据、传输参数、显示名）都属于 MiSub，CFST 只换地址。
+                desired[name] = swap_address(node.url, address)
+                continue
+            query, uuid = credentials[region["key"]] or (region["query"], get_vless_uuid())
+            desired[name] = f"vless://{uuid}@{address}:443?{query}#{urllib.parse.quote(name)}"
+    return desired
 
-    # Per-id read: the cached /profiles collection can lag the real profile by up
-    # to 30s, and every decision below depends on the true reference set.
-    live_refs = get_profile_refs(profile_id)
 
-    # The cached node list is a discovery hint only; the profile's own references
-    # are the other source of candidates, because a live managed node can be
-    # missing from that list entirely. Resolving every candidate by id gives the
-    # authoritative name for each one, so nothing is classified from cached data.
-    candidates = list(dict.fromkeys([node.id for node in all_managed] + live_refs))
-    resolution = resolve_nodes_by_id(candidates)
-    if resolution.unknown:
-        details = "; ".join(
-            f"{node_id}: {reason}" for node_id, reason in resolution.unknown.items()
+class PushRequest(Protocol):
+    """The existing transport seam, including its optional JSON body."""
+
+    def __call__(
+        self, method: str, path: str, data: Any = None
+    ) -> dict[str, Any] | None: ...
+
+
+@dataclass
+class _PushExecution:
+    """Private implementation; callers and tests use execute_push."""
+
+    prepare: Callable[[], dict[str, str]]
+    request: PushRequest
+    pending_path: Path
+    sleep: Callable[[float], None]
+
+    def list_managed_nodes(self) -> list[ManagedNode]:
+        response = require_success(self.request("GET", "/manual-nodes?pageSize=200"), "list manual nodes")
+        data = response.get("data")
+        if not isinstance(data, list):
+            raise RuntimeError("manual-nodes response data is not a list")
+        result: list[ManagedNode] = []
+        for node in data:
+            if not isinstance(node, dict):
+                continue
+            name, node_id, url = str(node.get("name", "")), node.get("id"), node.get("url")
+            if is_managed_name(name) and isinstance(node_id, str) and isinstance(url, str):
+                result.append(ManagedNode(node_id, name, url))
+        return result
+
+    def list_profiles(self) -> list[dict[str, Any]]:
+        response = require_success(self.request("GET", "/profiles"), "list profiles")
+        profiles = response.get("data")
+        if not isinstance(profiles, list) or not all(isinstance(profile, dict) for profile in profiles):
+            raise RuntimeError("profiles response data is not a list of objects")
+        return profiles
+
+    def other_profile_refs(self,
+        profiles: list[dict[str, Any]], target_profile: dict[str, Any], old_managed_ids: set[str]
+    ) -> dict[str, set[str]]:
+        """Find managed nodes referenced by other profiles using fresh profile reads.
+
+        The collection returned by ``GET /profiles`` is only a discovery snapshot.
+        Each foreign profile is read again by id before a node can be reclaimed. Any
+        failed or malformed fresh read is an unknown safety condition, not evidence
+        that the profile has no references.
+        """
+        target_id = target_profile.get("id")
+        refs: dict[str, set[str]] = {}
+        for profile in profiles:
+            profile_id = profile.get("id")
+            if profile_id == target_id:
+                continue
+            if not isinstance(profile_id, str) or not profile_id:
+                raise RuntimeError("foreign profile has no valid id; refusing to reclaim")
+            try:
+                ids = set(self.get_profile_refs(profile_id)) & old_managed_ids
+            except Exception as exc:
+                raise RuntimeError(
+                    f"could not fresh-read other profile {profile_id}; refusing to reclaim"
+                ) from exc
+            if ids:
+                name = str(profile.get("name") or profile_id)
+                refs[name] = ids
+        return refs
+
+    def lookup_manual_node(self, node_id: str) -> NodeLookup:
+        """Return an explicit FOUND, MISSING, or UNKNOWN per-id read outcome."""
+        response = self.request("GET", f"/manual-nodes/{node_id}")
+        if response is None:
+            return NodeLookup(NodeLookupState.UNKNOWN, reason="API read failed or was exhausted")
+        if response.get("success") is not True:
+            error = response.get("error")
+            status = error.get("status") if isinstance(error, dict) else None
+            if status == 404:
+                return NodeLookup(NodeLookupState.MISSING, reason="authoritative HTTP 404")
+            return NodeLookup(NodeLookupState.UNKNOWN, reason=f"API read returned status {status!r}")
+        node = response.get("data")
+        if not isinstance(node, dict):
+            return NodeLookup(NodeLookupState.UNKNOWN, reason="API read returned invalid node data")
+        found_id, name, url = node.get("id"), node.get("name"), node.get("url")
+        if not (isinstance(found_id, str) and isinstance(name, str) and isinstance(url, str)):
+            return NodeLookup(NodeLookupState.UNKNOWN, reason="API read returned malformed node data")
+        if found_id != node_id:
+            return NodeLookup(NodeLookupState.UNKNOWN, reason="API read returned a different node id")
+        return NodeLookup(NodeLookupState.FOUND, ManagedNode(found_id, name, url))
+
+    def get_manual_node(self, node_id: str) -> ManagedNode | None:
+        """Read one node by id, raising when absence is not authoritative.
+
+        Upstream getManualNodeById() issues direct SQL, so a per-id read is always
+        fresh. Collection reads (GET /manual-nodes) go through the 30s TTL cache and
+        must never be used as verification evidence. ``None`` now means only an
+        authoritative HTTP 404; all other failures raise ``UnknownNodeLookup``.
+        """
+        outcome = self.lookup_manual_node(node_id)
+        if outcome.state is NodeLookupState.FOUND:
+            assert outcome.node is not None
+            return outcome.node
+        if outcome.state is NodeLookupState.MISSING:
+            return None
+        raise UnknownNodeLookup(f"manual node {node_id} lookup UNKNOWN: {outcome.reason}")
+
+    def resolve_nodes_by_id(self, node_ids: list[str]) -> NodeResolution:
+        """Resolve ids without turning an uncertain read into a missing node."""
+        found: dict[str, ManagedNode] = {}
+        missing: set[str] = set()
+        unknown: dict[str, str] = {}
+        for node_id in node_ids:
+            try:
+                node = self.get_manual_node(node_id)
+            except UnknownNodeLookup as exc:
+                unknown[node_id] = str(exc)
+                continue
+            if node is None:
+                missing.add(node_id)
+            else:
+                found[node_id] = node
+        return NodeResolution(found=found, missing=missing, unknown=unknown)
+
+    def get_profile_refs(self, profile_id: str) -> list[str]:
+        """Read a profile's manual node references.
+
+        Upstream getProfileById() issues direct SQL, so this is fresh even when a
+        cached GET /profiles list would still show a pre-write snapshot.
+        """
+        response = require_success(
+            self.request("GET", f"/profiles/{profile_id}"), f"read profile {profile_id}"
         )
+        data = response.get("data")
+        if not isinstance(data, dict):
+            raise RuntimeError(f"profile {profile_id} response data is not an object")
+        return profile_node_ids(data)
+
+    def create_managed_node(self, name: str, url: str) -> ManagedNode:
+        response = require_success(
+            self.request("POST", "/manual-nodes", {"name": name, "url": url}),
+            f"create {name}",
+        )
+        node = response.get("data")
+        if not isinstance(node, dict) or not isinstance(node.get("id"), str):
+            raise RuntimeError(f"create {name} returned no node id")
+        return ManagedNode(node["id"], name, str(node.get("url", "")))
+
+    def update_managed_node_url(self, node: ManagedNode, url: str) -> ManagedNode:
+        """Update a node's URL in place.
+
+        This is the route that makes the whole design safe: upstream
+        PATCH /manual-nodes/:id reads the node by id and writes only that
+        subscription row. It never calls putProfile(), so it cannot revert a profile
+        reference no matter which isolate serves it or how stale that isolate's
+        cached collections are.
+        """
+        response = require_success(
+            self.request("PATCH", f"/manual-nodes/{node.id}", {"url": url}),
+            f"update {node.name}",
+        )
+        data = response.get("data")
+        if not isinstance(data, dict) or data.get("url") != url:
+            raise RuntimeError(f"MiSub did not return the updated url for {node.name}")
+        return ManagedNode(node.id, node.name, url)
+
+    def delete_nodes(self, nodes: list[ManagedNode], phase: str) -> None:
+        for node in nodes:
+            response = self.request("DELETE", f"/manual-nodes/{node.id}")
+            if not response or response.get("success") is not True:
+                raise RuntimeError(f"{phase}: delete {node.name} failed")
+            print(f"  Deleted ({phase}): {node.name}")
+
+    def wait_for_node_visibility(self, nodes: list[ManagedNode]) -> None:
+        """Block until every id resolves through a per-id read.
+
+        A newly created node can be acknowledged by POST before PATCH /profiles can
+        resolve it (02:03:42, HTTP 400 manual_node_id_not_found). Per-id reads are
+        used because they hit direct SQL; a cached collection read could report a
+        node as missing long after it exists, or as present after deletion.
+        """
+        pending = list(nodes)
+        for attempt in range(1, NODE_VISIBILITY_ATTEMPTS + 1):
+            pending = [node for node in pending if self.get_manual_node(node.id) is None]
+            if not pending:
+                if nodes:
+                    print(f"  All {len(nodes)} new node(s) are visible")
+                return
+            if attempt < NODE_VISIBILITY_ATTEMPTS:
+                print(
+                    f"  {len(pending)} new node(s) not visible yet; "
+                    f"retrying ({attempt + 1}/{NODE_VISIBILITY_ATTEMPTS})",
+                    file=sys.stderr,
+                )
+                self.sleep(NODE_VISIBILITY_DELAY_SECONDS)
         raise RuntimeError(
-            f"manual node lookup is UNKNOWN; refusing reconciliation: {details}"
+            f"new nodes are not visible via the MiSub API after "
+            f"{NODE_VISIBILITY_ATTEMPTS} attempts: {len(pending)} missing"
         )
-    resolved = resolution.found
-    known_managed = [node for node in resolved.values() if is_managed_name(node.name)]
-    managed_ids = {node.id for node in known_managed}
-    ghosts = len(resolution.missing)
-    if ghosts:
-        print(f"  Ignoring {ghosts} node id(s) that no longer resolve")
 
-    foreign = other_profile_refs(profiles, profile, managed_ids)
-    foreign_ids = set().union(*foreign.values()) if foreign else set()
-    if foreign:
-        details = "; ".join(f"{name}={len(ids)}" for name, ids in foreign.items())
-        print(f"  Preserving {len(foreign_ids)} node(s) referenced by other profiles: {details}")
+    def bind_profile_refs(self, profile_id: str, manual_node_ids: list[str]) -> None:
+        """Write the profile reference set, then verify it with a fresh read.
 
-    managed, reclaim = select_managed_by_name(
-        known_managed, set(live_refs), set(desired_urls), protected_ids=foreign_ids
-    )
-    if pending_phase == "create":
-        unresolved = [name for name in desired_urls if name not in managed]
-        if unresolved:
-            names = ", ".join(unresolved)
+        Two failure modes are handled explicitly:
+
+        A stale subscriptions snapshot in the serving isolate makes upstream reject
+        brand-new ids with HTTP 400 manual_node_id_not_found (02:03:42). Retrying is
+        the correct response: the snapshot is at most 30s old, and a retry may also be
+        served by a different isolate. Every id is confirmed resolvable by a fresh
+        per-id read first, so a retry loop cannot mask a genuinely missing node.
+
+        The value echoed back by PATCH is not accepted as proof, because it is built
+        from the request rather than re-read. Verification is a separate per-id read.
+        """
+        missing = [
+            node_id for node_id in manual_node_ids if self.get_manual_node(node_id) is None
+        ]
+        if missing:
             raise RuntimeError(
-                "pending create has no fresh per-name recovery evidence; "
-                f"refusing duplicate POST for: {names}"
+                f"refusing to bind: {len(missing)} node id(s) do not resolve by id"
             )
-    # Unmanaged refs are the user's own nodes (JP etc) and must be carried
-    # forward. A ref that did not resolve is a stale pointer left by an earlier
-    # failure and is dropped, because binding it back would be rejected.
-    preserved_ids = [
-        ref for ref in live_refs if ref in resolved and ref not in managed_ids
-    ]
-    dropped = len([ref for ref in live_refs if ref not in resolved])
-    if dropped:
-        print(f"  Dropping {dropped} stale profile node reference(s)")
-    if preserved_ids:
-        print(f"  Preserving {len(preserved_ids)} unmanaged profile node(s)")
 
-    # Every delete happens here, before any profile write. Deleting a node makes
-    # upstream write back a possibly stale profiles snapshot, so a delete can only
-    # revert references that predate this run; the fresh read further down
-    # observes that and the bind repairs it. Deleting after a bind is what caused
-    # the 12:07 outage.
-    if reclaim:
-        print(f"  Reclaiming {len(reclaim)} unreferenced duplicate node(s)")
-        mark_pending("reclaim")
-        delete_nodes(reclaim, "reclaim")
+        for attempt in range(1, BIND_ATTEMPTS + 1):
+            response = self.request(
+                "PATCH", f"/profiles/{profile_id}", {"manualNodeIds": manual_node_ids}
+            )
+            if response and response.get("success") is True:
+                observed = self.get_profile_refs(profile_id)
+                if observed == manual_node_ids:
+                    return
+                reason = f"profile still shows {len(observed)} of {len(manual_node_ids)} refs"
+            else:
+                reason = "PATCH /profiles was rejected"
+            if attempt < BIND_ATTEMPTS:
+                print(
+                    f"  bind attempt {attempt} failed ({reason}); "
+                    f"retrying ({attempt + 1}/{BIND_ATTEMPTS})",
+                    file=sys.stderr,
+                )
+                self.sleep(BIND_RETRY_DELAY_SECONDS)
+        raise RuntimeError(
+            f"could not bind {len(manual_node_ids)} profile refs after {BIND_ATTEMPTS} attempts"
+        )
 
-    print("\n[2/5] Creating any missing managed node...")
-    created: list[ManagedNode] = []
-    if any(name not in managed for name in desired_urls):
-        mark_pending("create")
-    for name, url in desired_urls.items():
-        if name in managed:
-            continue
-        node = create_managed_node(name, url)
-        managed[name] = node
-        created.append(node)
-        print(f"  Created: {name}")
-    if not created:
-        print("  Nothing to create; the managed set is complete")
+    def verify_final_state(self,
+        profile_id: str, expected_profile_ids: list[str], managed: dict[str, ManagedNode],
+        desired_urls: dict[str, str],
+    ) -> None:
+        """Verify the outcome through fresh per-id reads only.
 
-    print("\n[3/5] Confirming new nodes resolve by id...")
-    wait_for_node_visibility(created)
+        GET /manual-nodes and GET /profiles both serve the 30s TTL cached collection,
+        so they can report a pre-write snapshot and turn a real failure green. Only
+        per-id reads hit direct SQL, so only per-id reads are evidence.
+        """
+        final_refs = self.get_profile_refs(profile_id)
+        if final_refs != expected_profile_ids:
+            missing = [ref for ref in expected_profile_ids if ref not in final_refs]
+            extra = [ref for ref in final_refs if ref not in expected_profile_ids]
+            raise RuntimeError(
+                "profile references do not match the reconciled node set: "
+                f"missing={len(missing)} extra={len(extra)} "
+                f"order_match={final_refs == expected_profile_ids}"
+            )
+        for name, url in desired_urls.items():
+            node = self.get_manual_node(managed[name].id)
+            if node is None:
+                raise RuntimeError(f"managed node {name} does not resolve by id after reconcile")
+            if node.name != name or node.url != url:
+                raise RuntimeError(f"managed node {name} does not carry the current Top{TOP_N} url")
 
-    print("\n[4/5] Updating managed node URLs in place...")
-    changed = 0
-    if any(managed[name].url != url for name, url in desired_urls.items()):
-        mark_pending("update")
-    for name, url in desired_urls.items():
-        node = managed[name]
-        if node.url == url:
-            continue
-        managed[name] = update_managed_node_url(node, url)
-        changed += 1
-        print(f"  Updated: {name}")
-    print(f"  {changed} url(s) changed, {len(desired_urls) - changed} already current")
-    validate_replacement(list(managed.values()))
+    def run(self) -> None:
+        print("=== MiSub CM Node Push (in-place reconcile) ===")
+        pending_record = load_pending_reconcile(path=self.pending_path)
+        pending_written = pending_record is not None
+        pending_phase = pending_record.get("phase") if pending_record else None
+        if pending_written:
+            print(f"  Resuming a pending reconcile recorded at {self.pending_path}")
 
-    print("\n[5/5] Reconciling profile references...")
-    expected_profile_ids = preserved_ids + [managed[name].id for name in desired_urls]
-    current_refs = get_profile_refs(profile_id)
-    if current_refs == expected_profile_ids:
-        print(f"  Profile {PROFILE_NAME} already references the correct {len(current_refs)} nodes")
-    else:
-        missing = [ref for ref in expected_profile_ids if ref not in current_refs]
-        extra = [ref for ref in current_refs if ref not in expected_profile_ids]
-        print(f"  Repairing profile references: {len(missing)} missing, {len(extra)} extra")
-        mark_pending("bind")
-        bind_profile_refs(profile_id, expected_profile_ids)
-        print(f"  Profile {PROFILE_NAME} bound to {len(expected_profile_ids)} nodes")
+        def mark_pending(phase: str) -> None:
+            nonlocal pending_written
+            if pending_written:
+                return
+            write_pending_reconcile(managed, desired_urls, phase, path=self.pending_path)
+            pending_written = True
 
-    verify_final_state(profile_id, expected_profile_ids, managed, desired_urls)
-    clear_pending_reconcile()
-    print(f"  Verified {len(desired_urls)} managed node(s) and {len(expected_profile_ids)} profile refs")
-    print(f"\nDone. {changed} url(s) updated, {len(created)} created, {len(reclaim)} reclaimed.")
+        print("\n[1/5] Reading current MiSub state...")
+        all_managed = self.list_managed_nodes()
+        profiles = self.list_profiles()
+        profile = find_profile(profiles)
+        profile_id = profile.get("id")
+        if not isinstance(profile_id, str):
+            raise RuntimeError("profile has no id")
+
+        # Per-id read: the cached /profiles collection can lag the real profile by up
+        # to 30s, and every decision below depends on the true reference set.
+        live_refs = self.get_profile_refs(profile_id)
+
+        # The cached node list is a discovery hint only; the profile's own references
+        # are the other source of candidates, because a live managed node can be
+        # missing from that list entirely. Resolving every candidate by id gives the
+        # authoritative name for each one, so nothing is classified from cached data.
+        candidates = list(dict.fromkeys([node.id for node in all_managed] + live_refs))
+        resolution = self.resolve_nodes_by_id(candidates)
+        if resolution.unknown:
+            details = "; ".join(
+                f"{node_id}: {reason}" for node_id, reason in resolution.unknown.items()
+            )
+            raise RuntimeError(
+                f"manual node lookup is UNKNOWN; refusing reconciliation: {details}"
+            )
+        resolved = resolution.found
+        known_managed = [node for node in resolved.values() if is_managed_name(node.name)]
+        managed_ids = {node.id for node in known_managed}
+        ghosts = len(resolution.missing)
+        if ghosts:
+            print(f"  Ignoring {ghosts} node id(s) that no longer resolve")
+
+        foreign = self.other_profile_refs(profiles, profile, managed_ids)
+        foreign_ids = set().union(*foreign.values()) if foreign else set()
+        if foreign:
+            details = "; ".join(f"{name}={len(ids)}" for name, ids in foreign.items())
+            print(f"  Preserving {len(foreign_ids)} node(s) referenced by other profiles: {details}")
+
+        managed, reclaim = select_managed_by_name(
+            known_managed, set(live_refs), expected_managed_names(), protected_ids=foreign_ids
+        )
+        # 目标 URL 只在看清现有节点之后才推导：地址换掉，凭据/参数沿用节点自己的。
+        desired_urls = self.prepare(managed)
+        if pending_phase == "create":
+            unresolved = [name for name in desired_urls if name not in managed]
+            if unresolved:
+                names = ", ".join(unresolved)
+                raise RuntimeError(
+                    "pending create has no fresh per-name recovery evidence; "
+                    f"refusing duplicate POST for: {names}"
+                )
+        # Unmanaged refs are the user's own nodes (JP etc) and must be carried
+        # forward. A ref that did not resolve is a stale pointer left by an earlier
+        # failure and is dropped, because binding it back would be rejected.
+        preserved_ids = [
+            ref for ref in live_refs if ref in resolved and ref not in managed_ids
+        ]
+        dropped = len([ref for ref in live_refs if ref not in resolved])
+        if dropped:
+            print(f"  Dropping {dropped} stale profile node reference(s)")
+        if preserved_ids:
+            print(f"  Preserving {len(preserved_ids)} unmanaged profile node(s)")
+
+        # Every delete happens here, before any profile write. Deleting a node makes
+        # upstream write back a possibly stale profiles snapshot, so a delete can only
+        # revert references that predate this run; the fresh read further down
+        # observes that and the bind repairs it. Deleting after a bind is what caused
+        # the 12:07 outage.
+        if reclaim:
+            print(f"  Reclaiming {len(reclaim)} unreferenced duplicate node(s)")
+            mark_pending("reclaim")
+            self.delete_nodes(reclaim, "reclaim")
+
+        print("\n[2/5] Creating any missing managed node...")
+        created: list[ManagedNode] = []
+        if any(name not in managed for name in desired_urls):
+            mark_pending("create")
+        for name, url in desired_urls.items():
+            if name in managed:
+                continue
+            node = self.create_managed_node(name, url)
+            managed[name] = node
+            created.append(node)
+            print(f"  Created: {name}")
+        if not created:
+            print("  Nothing to create; the managed set is complete")
+
+        print("\n[3/5] Confirming new nodes resolve by id...")
+        self.wait_for_node_visibility(created)
+
+        print("\n[4/5] Updating managed node URLs in place...")
+        changed = 0
+        if any(managed[name].url != url for name, url in desired_urls.items()):
+            mark_pending("update")
+        for name, url in desired_urls.items():
+            node = managed[name]
+            if node.url == url:
+                continue
+            managed[name] = self.update_managed_node_url(node, url)
+            changed += 1
+            print(f"  Updated: {name}")
+        print(f"  {changed} url(s) changed, {len(desired_urls) - changed} already current")
+        validate_replacement(list(managed.values()))
+
+        print("\n[5/5] Reconciling profile references...")
+        expected_profile_ids = preserved_ids + [managed[name].id for name in desired_urls]
+        current_refs = self.get_profile_refs(profile_id)
+        if current_refs == expected_profile_ids:
+            print(f"  Profile {PROFILE_NAME} already references the correct {len(current_refs)} nodes")
+        else:
+            missing = [ref for ref in expected_profile_ids if ref not in current_refs]
+            extra = [ref for ref in current_refs if ref not in expected_profile_ids]
+            print(f"  Repairing profile references: {len(missing)} missing, {len(extra)} extra")
+            mark_pending("bind")
+            self.bind_profile_refs(profile_id, expected_profile_ids)
+            print(f"  Profile {PROFILE_NAME} bound to {len(expected_profile_ids)} nodes")
+
+        self.verify_final_state(profile_id, expected_profile_ids, managed, desired_urls)
+        clear_pending_reconcile(path=self.pending_path)
+        print(f"  Verified {len(desired_urls)} managed node(s) and {len(expected_profile_ids)} profile refs")
+        print(f"\nDone. {changed} url(s) updated, {len(created)} created, {len(reclaim)} reclaimed.")
+
+
+def execute_push(
+    *,
+    prepare: Callable[[], dict[str, str]],
+    request: PushRequest,
+    pending_path: Path,
+    sleep: Callable[[float], None],
+) -> None:
+    """Reconcile using explicit runtime dependencies, preserving partial effects.
+
+    prepare reads the desired inputs and runs every preflight; it is called only
+    after pending validation. request follows the existing transport contract.
+    pending_path must be private to this execution environment. sleep controls
+    bounded visibility and bind retries; neither dependency changes the policy.
+    """
+    if not isinstance(pending_path, Path):
+        raise TypeError("pending reconcile path is invalid")
+    _PushExecution(prepare, request, pending_path, sleep).run()
+
+
+def main() -> None:
+    host = os.environ.get("CFST_NODE_HOST", "").strip()
+    prepare = (lambda managed: expected_published_urls(host)) if host else _prepare_desired_urls
+    if host:
+        print(f"Publishing through the stable address {host} (no IP substitution)")
+    execute_push(
+        prepare=prepare,
+        request=api_request,
+        pending_path=PENDING_RECONCILE_FILE,
+        sleep=time.sleep,
+    )
 
 
 if __name__ == "__main__":

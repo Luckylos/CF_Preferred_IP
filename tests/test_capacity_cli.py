@@ -15,10 +15,12 @@ def test_overflow_does_not_enter_quality_blacklist(tmp_path):
     saved = '2026-10-18 01:00:00'
     rank.write_contenders(pool, [rank.Contender(ip, '2026-10-16 12:00:00', '-', 'screen', saved) for ip in ips])
     hist.write_text(''.join(f'{(now-timedelta(minutes=i*15)).strftime(rank.TS_FORMAT)}\t{ip}\tPASS\t50\t\n' for i in range(40) for ip in ips))
-    r = subprocess.run([sys.executable, str(ROOT/'rank.py'), '--history', str(hist), '--contenders', str(pool),
+    from test_rank_cli import run_rank
+
+    r = run_rank(['--history', str(hist), '--contenders', str(pool),
                         '--best', str(best), '--blacklist', str(quality), '--capacity-cooldown', str(capacity),
                         '--now', now.strftime(rank.TS_FORMAT), '--pool-target', '1', '--pool-max', '3',
-                        '--trim-headroom', '1', '--core-n', '1'], capture_output=True, text=True)
+                        '--trim-headroom', '1', '--core-n', '1'])
     assert r.returncode == 0, r.stderr
     assert 'overflow' in r.stdout
     assert not quality.exists() or quality.read_text() == ''

@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-TEST_UUID = "00000000-0000-4000-8000-000000000000"
+TEST_UUID = "00000000-0000-4000-8000-000000000002"
 
 
 def _write_executable(path: Path, content: str) -> None:
@@ -51,6 +51,8 @@ CFST_TEMPLATE_HK_PATH="/golden?ed=512"
 CFST_TEMPLATE_HK_FP="firefox"
 CFST_TEMPLATE_HK_ALPN="h2"
 CFST_TEMPLATE_HK_LEGACY_INSECURE_FLAGS=0
+CFST_TEMPLATE_HK_QUERY='encryption=none&security=tls&sni=hk-golden.example&fp=firefox&type=ws&host=hk-golden.example&path=%2Fgolden%3Fed%3D512&alpn=h2'
+CFST_TEMPLATE_HK_AUDIT_KEY=HK
 CFST_TEMPLATE_SG_KEY=SG
 CFST_TEMPLATE_SG_NAME_PREFIX="🧪 SG Golden"
 CFST_TEMPLATE_SG_SNI="sg-golden.example"
@@ -59,6 +61,18 @@ CFST_TEMPLATE_SG_PATH="/golden?ed=1024"
 CFST_TEMPLATE_SG_FP="safari"
 CFST_TEMPLATE_SG_ALPN=""
 CFST_TEMPLATE_SG_LEGACY_INSECURE_FLAGS=1
+CFST_TEMPLATE_SG_QUERY='encryption=none&security=tls&sni=sg-golden.example&fp=safari&type=ws&host=sg-golden.example&path=%2Fgolden%3Fed%3D1024&insecure=0&allowInsecure=0'
+CFST_TEMPLATE_SG_AUDIT_KEY=SG
+CFST_TEMPLATE_HT_KEY=HT
+CFST_TEMPLATE_HT_NAME_PREFIX="🧪 HK Tamago"
+CFST_TEMPLATE_HT_SNI="ht-golden.example"
+CFST_TEMPLATE_HT_HOST="ht-golden.example"
+CFST_TEMPLATE_HT_PATH="/tamago?ed=2560"
+CFST_TEMPLATE_HT_FP="chrome"
+CFST_TEMPLATE_HT_ALPN=""
+CFST_TEMPLATE_HT_LEGACY_INSECURE_FLAGS=0
+CFST_TEMPLATE_HT_QUERY='encryption=none&security=tls&sni=ht-golden.example&fp=chrome&type=xhttp&host=ht-golden.example&path=%2Ftamago&mode=auto'
+CFST_TEMPLATE_HT_AUDIT_KEY=HK
 
 declare -A NODE_HK=(
   [key]="$CFST_TEMPLATE_HK_KEY"
@@ -100,6 +114,7 @@ def _run_local_verifier(sandbox: Path) -> tuple[subprocess.CompletedProcess[str]
 
     shutil.copy2(ROOT / "verify_vless.sh", sandbox / "vcheck.sh")
     shutil.copy2(ROOT / "ip_validation.py", sandbox / "ip_validation.py")
+    shutil.copy2(ROOT / "vless_template.py", sandbox / "vless_template.py")
     (sandbox / "vcheck.sh").chmod(
         (sandbox / "vcheck.sh").stat().st_mode | stat.S_IXUSR
     )
@@ -212,10 +227,12 @@ def test_shell_and_python_consumers_share_canonical_template(tmp_path: Path) -> 
 def test_production_config_exposes_every_pusher_template_field() -> None:
     """The canonical source must be explicit, not only a test-fixture convention."""
     text = (ROOT / "config.sh").read_text(encoding="utf-8")
-    for region in ("HK", "SG"):
+    for region in ("HK", "SG", "HT"):
         for field in (
             "KEY",
             "NAME_PREFIX",
+            "QUERY",
+            "AUDIT_KEY",
             "SNI",
             "HOST",
             "PATH",
@@ -224,6 +241,8 @@ def test_production_config_exposes_every_pusher_template_field() -> None:
             "LEGACY_INSECURE_FLAGS",
         ):
             assert f"CFST_TEMPLATE_{region}_{field}=" in text
+    # Only the probe templates need shell NODE_* projections.
+    for region in ("HK", "SG"):
         assert f'[host]="$CFST_TEMPLATE_{region}_HOST"' in text
         assert f'[path]="$CFST_TEMPLATE_{region}_PATH"' in text
         assert f'[fp]="$CFST_TEMPLATE_{region}_FP"' in text

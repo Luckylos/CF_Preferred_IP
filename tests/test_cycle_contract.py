@@ -33,11 +33,11 @@ RANK_THRESHOLD_FLAGS = {
     "--peak-hours": "RANK_PEAK_HOURS",
 }
 RANK_EVIDENCE_FLAGS = (
-    "--history", "--contenders", "--best", "--blacklist", "--now",
-    "--audit-requested", "--audit-returned", "--systemic", "--audit-ok", "--tiers-out",
+    "--observations", "--contenders", "--best", "--blacklist", "--now",
+    "--audit-run", "--audit-targets", "--reference-file", "--audit-start-ns", "--audit-ok", "--tiers-out",
 )
 
-SYSTEMIC_GUARD_RE = re.compile(r'^if \[ "\$SYSTEMIC_ROUND" = "1" \]; then$')
+SYSTEMIC_GUARD_RE = re.compile(r'^if \[ "\$GUARD" != "none" \]; then$')
 SLOW_ONLY_RE = re.compile(r'^if \[ "\$MODE" = "slow" \]; then$')
 APPLY_GUARD_RE = re.compile(r'^if \[ "\$SHADOW" = "0" \]; then$')
 SHADOW_GUARD_RE = re.compile(r'^if \[ "\$SHADOW" = "1" \]; then$')
@@ -127,7 +127,7 @@ class TestSystemicGuard:
 
     def test_verdict_computed_before_guard(self) -> None:
         code = code_lines(CYCLE_SH)
-        assign = first_index(code, "SYSTEMIC_ROUND=$(python3")
+        assign = first_index(code, "AUDIT_FACTS=$(python3")
         for start, _end in regions(code, SYSTEMIC_GUARD_RE):
             assert assign < start
 
@@ -152,14 +152,10 @@ class TestFastPath:
         assert "exit 0" in after, "tiers 文件不存在时 fast 必须 exit 0"
         assert "!seen[$0]++" in code, "core ∪ challengers 需去重"
 
-    def test_emergency_only_marks_log(self) -> None:
+    def test_emergency_marks_log(self) -> None:
         code = code_lines(CYCLE_SH)
-        assert "EMERGENCY=1" in code
-        hits = line_indices(code, "$EMERGENCY")
-        assert hits, "emergency 标记必须进入日志行"
-        for idx in hits:
-            ln = code.splitlines()[idx].lstrip()
-            assert ln.startswith(("echo", "printf", "if", "elif", "FLAGS", "CYCLE")), ln
+        assert "EMERGENCY=1" in code and "emergency=1" in code
+        assert any("$EMERGENCY" in line and "emergency=1" in line for line in code.splitlines())
 
 
 class TestRankAndApply:
@@ -234,13 +230,11 @@ class TestLegacyRemoved:
 
 
 class TestAuditAndLogging:
-    def test_audit_returned_counts_ipv4_rows_in_results_block(self, tmp_path) -> None:
-        from cycle_result import assess_audit
-        path=tmp_path/'audit'
-        path.write_text('10.0.0.9 PASS\n=== AUDIT RESULTS ===\n10.0.0.1 PASS\n10.0.0.2 FAIL\nnoise\n')
-        evidence=assess_audit(2,audit_path=path)
-        assert evidence.returned==2 and evidence.guard=='none'
-        assert 'cycle_result.py" audit --path "$AUDIT_OUT"' in code_lines(CYCLE_SH)
+    def test_cycle_reads_structured_audit_facts(self) -> None:
+        code = code_lines(CYCLE_SH)
+        assert 'audit_evidence.py" facts "$OBSERVATIONS" "$AUDIT_REF"' in code
+        assert 'cycle_result.py" audit --path "$AUDIT_OUT"' not in code
+        assert "--history" not in rank_invocation(code)
 
     def test_audit_credential_failure_marks_no_evidence(self) -> None:
         code = code_lines(CYCLE_SH)

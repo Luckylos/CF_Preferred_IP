@@ -18,8 +18,8 @@ suite was green while production broke.
 from __future__ import annotations
 
 import importlib.util
-import io
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -37,8 +37,8 @@ push = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = push
 SPEC.loader.exec_module(push)
 
-PROFILE_ID = "81b4d78e-2176-4bd3-bd09-24eba3592005"
-UUID = "00000000-0000-4000-8000-000000000000"
+PROFILE_ID = "00000000-0000-4000-8000-000000000005"
+UUID = "00000000-0000-4000-8000-000000000002"
 OLD_IPS = ["9.9.9.1", "9.9.9.2", "9.9.9.3"]
 NEW_IPS = ["104.18.0.107", "104.21.47.37", "104.18.34.253"]
 
@@ -57,9 +57,9 @@ def managed_name_to_region(name: str) -> dict:
 
 
 def build_production_fake(**kwargs) -> FakeMiSub:
-    """2 preserved unmanaged nodes + 6 managed nodes on the OLD ips.
+    """2 preserved unmanaged nodes + one managed node per name on the OLD ips.
 
-    This is the shape of the real profile: LeGend = 2 preserved + 6 CFST.
+    This is the shape of the real profile: CFST Example = 2 preserved + one per CFST name.
     """
     subscriptions = [
         {"id": "preserved-jp-1", "name": "🇯🇵 JP AZ 01", "url": "vless://x@jp1.example:443#JP1"},
@@ -91,18 +91,14 @@ def build_production_fake(**kwargs) -> FakeMiSub:
 
 
 def run_push(fake: FakeMiSub, ips: list[str] | None = None):
-    """Drive push_to_misub.main() against the faithful fake."""
-    with (
-        patch.object(push, "api_request", side_effect=fake.request),
-        patch.object(push, "read_best_ips", return_value=list(ips or NEW_IPS)),
-        patch.object(push, "run_all_region_preflights"),
-        patch.object(push, "get_vless_uuid", return_value=UUID),
-        patch.object(push.time, "sleep"),
-        patch("sys.stdout", new_callable=io.StringIO),
-        patch("sys.stderr", new_callable=io.StringIO),
-    ):
-        push.main()
-
+    """Drive the real execution seam against the faithful fake, in private storage."""
+    with tempfile.TemporaryDirectory() as directory:
+        push.execute_push(
+            prepare=lambda managed: expected_urls(list(ips or NEW_IPS)),
+            request=fake.request,
+            pending_path=Path(directory) / "pending.json",
+            sleep=lambda seconds: None,
+        )
 
 def expected_urls(ips: list[str]) -> dict[str, str]:
     with patch.object(push, "get_vless_uuid", return_value=UUID):
@@ -193,7 +189,10 @@ class StaleCacheOutageTests(unittest.TestCase):
             expected_urls(ips),
             "every managed node must carry the current Top3 URL",
         )
-        self.assertEqual(len(refs), 8, "profile must end with 2 preserved + 6 managed")
+        self.assertEqual(
+            len(refs), 2 + len(MANAGED_NAMES),
+            "profile must end with 2 preserved + every managed node",
+        )
 
     def test_survives_delete_phase_with_stale_profiles_cache(self) -> None:
         """The 12:07 outage.
@@ -243,8 +242,8 @@ class StaleCacheOutageTests(unittest.TestCase):
         managed_refs = [r for r in refs if r in {n["id"] for n in fake.subs.values()
                                                  if n.get("name") in set(MANAGED_NAMES)}]
         self.assertEqual(
-            len(managed_refs), 6,
-            "the profile must still reference a full managed set, never a 2-node profile",
+            len(managed_refs), len(MANAGED_NAMES),
+            "the profile must still reference a full managed set, never a partial profile",
         )
 
     def test_correct_under_every_isolate_routing(self) -> None:
@@ -305,7 +304,7 @@ class SteadyStateContractTests(unittest.TestCase):
         run_push(fake)
 
         managed = fake.managed_by_name(set(MANAGED_NAMES))
-        self.assertEqual(len(managed), 6)
+        self.assertEqual(len(managed), len(MANAGED_NAMES))
         recreated = managed[victim["name"]]
         self.assertIn(recreated["id"], fake.profile_refs(PROFILE_ID))
         self.assertEqual(recreated["url"], expected_urls(NEW_IPS)[victim["name"]])
@@ -324,12 +323,12 @@ class SteadyStateContractTests(unittest.TestCase):
         run_push(fake)
 
         self.assertNotIn("leaked", fake.subs, "unreferenced duplicate must be reclaimed")
-        self.assertEqual(len(fake.managed_by_name(set(MANAGED_NAMES))), 6)
+        self.assertEqual(len(fake.managed_by_name(set(MANAGED_NAMES))), len(MANAGED_NAMES))
         self._assert_refs_complete(fake)
 
     def _assert_refs_complete(self, fake: FakeMiSub) -> None:
         refs = fake.profile_refs(PROFILE_ID)
-        self.assertEqual(len(refs), 8)
+        self.assertEqual(len(refs), 2 + len(MANAGED_NAMES))
         for node in fake.managed_by_name(set(MANAGED_NAMES)).values():
             self.assertIn(node["id"], refs)
 

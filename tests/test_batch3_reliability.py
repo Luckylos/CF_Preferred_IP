@@ -30,17 +30,20 @@ def _apply_sandbox(tmp_path: Path) -> Path:
     (sandbox / "misub.env").chmod(0o600)
     (sandbox / "config.sh").write_text(
         f'''CFST_DIR={sandbox}
+CFST_PUBLISH=misub
+CFST_DNS_TOP_N=1
 BEST="$CFST_DIR/best_ips.txt"
 APPLY_STATE="$CFST_DIR/.apply_state"
 MISUB_TOKEN_FILE="$CFST_DIR/misub.env"
 PUBLISH_TOP_N=1
 APPLY_COOLDOWN=0
-publish_set() {{ printf '%s\\n' '1.1.1.1'; }}
+read_publish_targets() {{ printf '%s\\n' '' '1.1.1.1'; }}
 compute_apply_state() {{ printf '%s\\n' 'same-state'; }}
 ''',
         encoding="utf-8",
     )
-    shutil.copy2(ROOT / "apply.sh", sandbox / "apply.sh")
+    for name in ("apply.sh", "publication_snapshot.py", "dns_selection.py", "ip_validation.py", "atomic_io.py"):
+        shutil.copy2(ROOT / name, sandbox / name)
     (sandbox / "apply.sh").chmod((sandbox / "apply.sh").stat().st_mode | stat.S_IXUSR)
     _write_executable(
         sandbox / "push_to_misub.py",
@@ -48,12 +51,13 @@ compute_apply_state() {{ printf '%s\\n' 'same-state'; }}
 import os
 import time
 from pathlib import Path
-marker = Path(os.environ["PUSH_MARKER"])
-with marker.open("a", encoding="utf-8") as handle:
-    handle.write("start\\n")
-time.sleep(0.8)
-with marker.open("a", encoding="utf-8") as handle:
-    handle.write("end\\n")
+def main():
+    marker = Path(os.environ["PUSH_MARKER"])
+    with marker.open("a", encoding="utf-8") as handle:
+        handle.write("start\\n")
+    time.sleep(0.8)
+    with marker.open("a", encoding="utf-8") as handle:
+        handle.write("end\\n")
 """,
     )
     return sandbox
@@ -65,6 +69,7 @@ def test_apply_allows_at_most_one_concurrent_external_reconcile(tmp_path: Path) 
     marker = sandbox / "pushes.log"
     env = os.environ.copy()
     env["PUSH_MARKER"] = str(marker)
+    env["APPLY_RETRY_ONLY"] = "0"
     first = subprocess.Popen(
         [str(sandbox / "apply.sh")],
         cwd=sandbox,

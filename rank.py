@@ -28,6 +28,7 @@ rank.py — Contender Pool 排名：单池连续采样 + 不确定性驱动排�
 from __future__ import annotations
 
 import argparse
+import json
 from cycle_result import RankReceipt, assess_audit, preflight_receipt
 import math
 import sys
@@ -40,6 +41,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from atomic_io import atomic_write
 from cooldown import record as record_cooldown  # noqa: E402
 from ip_validation import is_valid_ipv4  # noqa: E402
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from quality_evidence import Batch, Quality
 
 TS_FORMAT = "%Y-%m-%d %H:%M:%S"
 BEST_MARKER = "# --- BEST_IPS (machine-readable, one IP per line) ---"
@@ -90,6 +95,7 @@ class Stats:
     sigma: float = 0.0
     peak_samples: int = 0
     evaluation_completed: bool = False
+    quality: Quality | None = None
 
 
 @dataclass
@@ -444,12 +450,14 @@ def evict(ranked: list[Ranked], cfg: Config, guard: str,
     target_lcb = proven[cfg.pool_target - 1].lcb if len(proven) >= cfg.pool_target else None
     for r in ranked:
         st = r.stats
-        if (target_lcb is not None and st.evaluation_completed
+        if st.quality is not None and st.quality.state == "ineligible":
+            evicted[r.ip] = "quality_budget"
+        elif (r.ip not in protected and target_lcb is not None and st.evaluation_completed
                 and st.n_eff >= cfg.evict_min_neff and r.ucb < target_lcb):
             evicted[r.ip] = "unworthy"
-        elif st.n_eff >= cfg.min_neff and fail_lcb(st.fail, st.n_eff) > cfg.hard_max_fail:
+        elif st.quality is None and st.n_eff >= cfg.min_neff and fail_lcb(st.fail, st.n_eff) > cfg.hard_max_fail:
             evicted[r.ip] = "hard_fail"   # 发布资格仍用原始失败率（保守）
-        elif st.consecutive_unreachable >= cfg.unreachable_rounds:
+        elif st.quality is None and st.consecutive_unreachable >= cfg.unreachable_rounds:
             evicted[r.ip] = "unreachable"
     # 规则 4：规则 1 是相对规则，池同质化时停摆（谁也证明不了比第 POOL_TARGET 名差），池满 → 快筛停。
     # 此时在"已表征（n_eff ≥ evict_min_neff）且不在 lcb 前 POOL_TARGET 名"的 IP 中按 ucb 升序裁最差者，
@@ -460,8 +468,9 @@ def evict(ranked: list[Ranked], cfg: Config, guard: str,
     if cfg.trim_headroom > 0 and len(remaining) > limit:
         bench = {r.ip for r in remaining[: cfg.pool_target]}
         characterized = sorted((r for r in remaining
-                                if r.stats.evaluation_completed and r.stats.n_eff >= cfg.evict_min_neff
-                                and r.ip not in bench),
+                                if (r.stats.quality is not None or
+                                    (r.stats.evaluation_completed and r.stats.n_eff >= cfg.evict_min_neff))
+                                and r.ip not in bench and r.ip not in protected),
                                key=lambda r: (r.ucb, r.ip))
         for r in characterized[: min(cfg.trim_headroom, len(remaining) - limit)]:
             evicted[r.ip] = "overflow"
@@ -481,6 +490,8 @@ def append_blacklist(path: Path, ips: list[str], now: datetime) -> None:
 
 def publish_eligible(r: Ranked, cfg: Config, evicted: set[str]) -> bool:
     st = r.stats
+    if st.quality is not None:
+        return r.ip not in evicted and st.quality.state == "eligible"
     return (r.ip not in evicted and st.n_eff >= cfg.publish_min_neff and st.peak_ok
             and st.fail <= cfg.hard_max_fail)
 
@@ -505,6 +516,12 @@ def sticky_publish(ranked: list[Ranked], incumbents: list[str], cfg: Config,
                 changed = True
     if cfg.max_per_segment > 0:
         order = diversify_publish(order, eligible, cfg)
+    if any(r.stats.quality is not None for r in ranked):
+        members = order[:cfg.publish_top_n]
+        slots = incumbents[:cfg.publish_top_n]
+        newcomers = iter(ip for ip in members if ip not in slots)
+        order[:cfg.publish_top_n] = [ip if ip in members else next(newcomers) for ip in slots]
+        order[len(slots):cfg.publish_top_n] = list(newcomers)
     return order[: cfg.top_n]
 
 
@@ -632,6 +649,30 @@ def read_contenders(path: Path) -> list[Contender]:
     return out
 
 
+def _lifecycle_rows(path: Path, reference: str) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    return data["rows"] if data["reference"] == reference else {}
+
+
+def read_lifecycle(path: Path, reference: str, now: datetime) -> dict[str, tuple[str, str]]:
+    cutoff = (now - timedelta(days=7)).strftime(TS_FORMAT)
+    return {ip: (first, completed) for ip, (first, completed, seen) in _lifecycle_rows(path, reference).items()
+            if seen >= cutoff and is_valid_ipv4(ip) and parse_ts(first)
+            and (completed == "-" or parse_ts(completed))}
+
+
+def write_lifecycle(path: Path, reference: str, previous: dict[str, tuple[str, str]],
+                    active: list[Contender], capacity: list[Contender], now: datetime) -> None:
+    rows = {ip: row for ip, row in _lifecycle_rows(path, reference).items() if ip in previous}
+    stamp = now.strftime(TS_FORMAT)
+    rows.update({c.ip: [c.first_seen, c.evaluated_at, stamp] for c in active + capacity
+                 if parse_ts(c.first_seen)})
+    atomic_write(path, json.dumps({"reference": reference, "rows": rows}) + "\n")
+
+
 def write_contenders(path: Path, rows: list[Contender]) -> None:
     body = "".join(f"{r.ip}\t{r.first_seen}\t{r.last_sampled}\t{r.origin}\t{r.evaluated_at}\n" for r in rows)
     atomic_write(path, CONTENDERS_HEADER + "\n" + body)
@@ -685,14 +726,59 @@ class Outcome:
     evaluations: dict[str, str] = field(default_factory=dict)
 
 
+def opportunity_tiers(ranked: list[Ranked], cfg: Config, now: datetime) -> tuple[list[str], list[str]]:
+    from quality_evidence import phase
+
+    core = [r.ip for r in ranked if r.stats.n_eff >= cfg.min_neff][:min(cfg.core_n, 10)]
+    rest = [r for r in ranked if r.ip not in core and r.stats.quality.state != "ineligible"]
+    slot = phase(now)
+
+    def priority(r: Ranked):
+        q = r.stats.quality
+        return (not (slot and slot not in q.covered), q.last_attempt or datetime.min, -r.ucb, r.ip)
+
+    explore = sorted((r for r in rest if r.stats.n_eff < cfg.min_neff), key=priority)
+    promote = sorted((r for r in rest if r.stats.n_eff >= cfg.min_neff), key=priority)
+    budget = min(cfg.challenger_max, 10)
+    urgent = sorted((r for r in rest if slot and slot not in r.stats.quality.covered), key=priority)
+    selected = urgent[:budget]
+    chosen = {r.ip for r in selected}
+    explore = [r for r in explore if r.ip not in chosen]
+    promote = [r for r in promote if r.ip not in chosen]
+    quota = min(cfg.explore_slots, (budget - len(selected) + 1) // 2)
+    selected.extend((explore[:quota] + promote + explore[quota:])[:budget - len(selected)])
+    return core, [r.ip for r in selected]
+
+
 def run_rank(samples: list[Sample], pool: list[str], incumbents: list[str],
              now: datetime, cfg: Config, guard: str = "none", *,
-             contenders: list[Contender] | None = None) -> Outcome:
+             contenders: list[Contender] | None = None,
+             evidence: list[Batch] | None = None, reference: str = "",
+             lifecycle: dict[str, tuple[str, str]] | None = None,
+             current_run: str | None = None) -> Outcome:
     """samples 须为窗口内全部样本（不按池过滤）：轮基线/系统性轮是轮的属性，
     与池无关，否则池收缩会改变 q，破坏幂等。"""
+    qualities = {}
+    if evidence is not None:
+        from quality_evidence import assess, phase
+
+        cfg = replace(cfg, peak_hours={20, 21, 22, 23}, peak_min_samples=1)
+        qualities = {ip: assess(evidence, ip, reference, now) for ip in {b.ip for b in evidence} | set(pool)}
+        if guard == "none" and current_run is not None and not any(
+                b.run == current_run for ip in pool for b in qualities[ip].usable
+        ):
+            guard = "no_evidence"
+        samples = []
+        for ip, q in qualities.items():
+            for b in q.usable:
+                warm = [r for r in b.requests[1:] if r.state != "not_started"]
+                tt = [r.ttfb for r in warm if r.state == "ok" and r.ttfb is not None]
+                status = "PASS" if len(tt) == len(warm) else "PARTIAL" if tt else "FAIL"
+                samples.append(Sample(b.ts, ip, status, round(_median(tt)) if tt else 0))
     rounds = bucket_rounds(samples, cfg.round_minutes)
     baselines = round_baselines(rounds, cfg.floor_ms, cfg.baseline_min_pass)
-    if guard in ("none", "coverage") and detect_systemic_round(baselines, now, cfg.round_minutes):
+    if (evidence is None and guard in ("none", "coverage")
+            and detect_systemic_round(baselines, now, cfg.round_minutes)):
         guard = "systemic"   # 自动识别：最新轮失败率 ≥50%
     stats = ip_stats(samples, baselines, now, cfg.half_life_hours, cfg.peak_hours,
                      cfg.floor_ms, cfg.round_minutes,
@@ -703,12 +789,36 @@ def run_rank(samples: list[Sample], pool: list[str], incumbents: list[str],
             first_seen[sample.ip] = min(sample.ts, first_seen.get(sample.ip, sample.ts))
         contenders = [Contender(ip, first_seen[ip].strftime(TS_FORMAT), "-", "replay")
                       for ip in pool if ip in first_seen]
-    evaluations = complete_evaluations(contenders, samples, baselines, stats, now, cfg)
-    stats = {ip: replace(st, evaluation_completed=ip in evaluations) for ip, st in stats.items()}
+    protected = frozenset()
+    if evidence is None:
+        evaluations = complete_evaluations(contenders, samples, baselines, stats, now, cfg)
+    else:
+        evaluations = {ip: done for ip, (_, done) in (lifecycle or {}).items()
+                       if ip in pool and done != "-"}
+        for c in contenders:
+            q = qualities[c.ip]
+            coverage = {}
+            for b in q.usable:
+                if phase(b.ts):
+                    coverage.setdefault(b.ts.date(), set()).add(phase(b.ts))
+            if q.n_eff >= cfg.evict_min_neff and {1, 2} in coverage.values():
+                evaluations.setdefault(c.ip, now.strftime(TS_FORMAT))
+        protected = frozenset(incumbents) | frozenset(c.ip for c in contenders
+                              if (parse_ts(c.first_seen) or now) > now - timedelta(hours=48))
+        for ip in pool:
+            stats.setdefault(ip, Stats(0, 0, None, None, False, None, 0))
+    stats = {ip: replace(st, evaluation_completed=ip in evaluations, quality=qualities.get(ip))
+             for ip, st in stats.items()}
     ranked = rank_pool(pool, stats, cfg)
-    core, chal, _reserve = derive_tiers(ranked, cfg)
-    kept, evicted = evict(ranked, cfg, guard, frozenset(core))
-    published = sticky_publish(ranked, incumbents, cfg, {ip for ip, _ in evicted})
+    if evidence is None:
+        core, chal, _reserve = derive_tiers(ranked, cfg)
+        kept, evicted = evict(ranked, cfg, guard, frozenset(core))
+    else:
+        kept, evicted = evict(ranked, cfg, guard, protected)
+        kept_set = set(kept)
+        core, chal = opportunity_tiers([r for r in ranked if r.ip in kept_set], cfg, now)
+    published = None if evidence is not None and guard != "none" else sticky_publish(
+        ranked, incumbents, cfg, {ip for ip, _ in evicted})
     return Outcome(ranked, core, chal, kept, evicted, published, guard, evaluations)
 
 
@@ -716,7 +826,14 @@ def run_rank(samples: list[Sample], pool: list[str], incumbents: list[str],
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="contender pool ranking")
-    p.add_argument("--history", type=Path, required=True)
+    p.add_argument("--history", type=Path, help=argparse.SUPPRESS)
+    p.add_argument("--observations", type=Path)
+    p.add_argument("--reference-file", type=Path)
+    p.add_argument("--audit-start-ns", type=int)
+    p.add_argument("--audit-run")
+    p.add_argument("--audit-targets", type=Path)
+    p.add_argument("--audit-p10-ms", type=int, default=150)
+    p.add_argument("--audit-min-samples", type=int, default=10)
     p.add_argument("--contenders", type=Path, required=True)
     p.add_argument("--best", type=Path, required=True)
     p.add_argument("--blacklist", type=Path, required=True)
@@ -724,6 +841,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--capacity-cooldown-hours", type=float, default=6)
     p.add_argument("--now", required=True, help="YYYY-MM-DD HH:MM:SS")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--initialize-publication", action="store_true",
+                   help="allow an uninitialized isolated shadow output")
     p.add_argument("--audit-requested", type=int, default=None)
     p.add_argument("--audit-returned", type=int, default=None)
     p.add_argument("--systemic", type=int, choices=(0, 1), default=0)
@@ -783,7 +902,17 @@ def resolve_guard(args: argparse.Namespace) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.observations is None and (args.history is None or not args.dry_run):
+        parser.error("--observations is required for online ranking; --history requires --dry-run")
+    if args.observations is not None and (not args.audit_run or args.audit_targets is None
+                                          or args.reference_file is None or args.audit_start_ns is None):
+        parser.error("structured ranking requires a cycle ID, audit targets, receipt and start time")
+    return _run_cli(args)
+
+
+def _run_cli(args: argparse.Namespace) -> int:
     now = parse_ts(args.now)
     if now is None:
         print(f"rank: invalid --now {args.now!r}", file=sys.stderr)
@@ -796,8 +925,17 @@ def main(argv: list[str] | None = None) -> int:
     if capacity_path.resolve() == args.blacklist.resolve():
         print("rank: quality and capacity cooldown paths must differ", file=sys.stderr)
         return 2
+    lifecycle_path = args.contenders.with_name(args.contenders.name + ".lifecycle.json")
     if args.result_out is not None:
-        paths = [args.history, args.contenders, args.best, args.blacklist, capacity_path]
+        paths = [args.contenders, args.best, args.blacklist, capacity_path]
+        if args.history is not None:
+            paths.append(args.history)
+        if args.audit_targets is not None:
+            paths.append(args.audit_targets)
+        if args.observations is not None:
+            paths.extend([args.observations, lifecycle_path, args.best.with_name(".publish_desired.json")])
+        if args.reference_file is not None:
+            paths.append(args.reference_file)
         if args.tiers_out is not None:
             paths.extend([args.tiers_out, args.tiers_out / 'core.txt', args.tiers_out / 'challengers.txt'])
         preflight_receipt(args.result_out, paths)
@@ -805,9 +943,51 @@ def main(argv: list[str] | None = None) -> int:
 
     contenders = read_contenders(args.contenders)   # 文件不存在 → 空池，不报错
     pool = [c.ip for c in contenders]
-    samples = load_history(args.history, now, cfg.window_days)
-    incumbents = read_incumbents(args.best, cfg.publish_top_n)
-    out = run_rank(samples, pool, incumbents, now, cfg, guard, contenders=contenders)
+    samples = [] if args.observations is not None else load_history(args.history, now, cfg.window_days)
+    reference = ""
+    batch_id = ""
+    evidence = None
+    lifecycle = {}
+    if args.observations is not None:
+        from audit_evidence import completed
+
+        started = datetime.fromtimestamp(args.audit_start_ns // 10**9)
+        audit = completed(args.observations, args.reference_file,
+                          args.audit_targets.read_text().split(), args.audit_run, started, now,
+                          percent=args.audit_min_coverage_percent, p10_ms=args.audit_p10_ms,
+                          min_samples=args.audit_min_samples)
+        guard = audit.guard if args.audit_ok else "no_evidence"
+        reference = audit.reference
+        evidence = list(audit.evidence)
+        batch_id = args.audit_run
+        if reference:
+            lifecycle = read_lifecycle(lifecycle_path, reference, now)
+            contenders = [replace(c, first_seen=lifecycle.get(c.ip, (now.strftime(TS_FORMAT), "-"))[0])
+                          for c in contenders]
+    from dns_selection import Choice
+    from publication_snapshot import FILENAME, Publication, read, write
+
+    publication_path = args.best.with_name(FILENAME)
+    previous_publication = None
+    previous_choice = Choice("")
+    if evidence is None:
+        incumbents = read_incumbents(args.best, cfg.publish_top_n)
+    else:
+        try:
+            previous_publication = read(publication_path, expected_count=cfg.publish_top_n)
+            incumbents = list(previous_publication.members)
+            previous_choice = previous_publication.choice
+        except FileNotFoundError:
+            if not (args.initialize_publication or args.dry_run):
+                print(f"rank: publication snapshot missing at {publication_path}", file=sys.stderr)
+                return 1
+            incumbents = read_incumbents(args.best, cfg.publish_top_n)
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"rank: invalid publication snapshot: {exc}", file=sys.stderr)
+            return 1
+    out = run_rank(samples, pool, incumbents, now, cfg, guard, contenders=contenders,
+                   evidence=evidence, reference=reference, lifecycle=lifecycle,
+                   current_run=batch_id if evidence is not None else None)
     guard = out.guard
 
     if guard == "no_evidence" or out.published is None:
@@ -828,13 +1008,20 @@ def main(argv: list[str] | None = None) -> int:
             continue
         seen = by_ip[c.ip].stats.last_seen
         last = seen.strftime(TS_FORMAT) if seen else c.last_sampled
-        new_rows.append(Contender(c.ip, c.first_seen, last, c.origin, out.evaluations.get(c.ip, "-")))
+        completed = c.evaluated_at if evidence is not None and not reference else out.evaluations.get(c.ip, "-")
+        new_rows.append(Contender(c.ip, c.first_seen, last, c.origin, completed))
 
     # 人类可读输出
     print(f"rank: now={args.now} samples={len(samples)} pool_in={len(pool)} guard={guard}"
           f"{' (dry-run)' if args.dry_run else ''}")
-    print(f"Top {cfg.top_n} by lcb (published set first):")
-    for ip in published:
+    if evidence is not None:
+        print(f"rank: stable MiSub members={len(published)}; current reference only")
+        print(f"Top {cfg.top_n} by lcb (strength):")
+        display = [r.ip for r in out.ranked[:cfg.top_n]]
+    else:
+        print(f"Top {cfg.top_n} by lcb (published set first):")
+        display = published
+    for ip in display:
         r = by_ip.get(ip)
         if r is None:
             print(f"  {ip:<18s} (incumbent, not in pool)")
@@ -843,6 +1030,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {ip:<18s} lcb={r.lcb:.4f} u={r.u:.4f} ucb={r.ucb:.4f} n_eff={st.n_eff:.2f} "
               f"sigma={st.sigma:.3f} fail={st.fail * 100:.1f}% med={_fmt(st.med)} p90={_fmt(st.tail)} "
               f"peak24={st.peak_samples} peak_ok={int(st.peak_ok)}")
+        if st.quality is not None:
+            q = st.quality
+            for name, window in (("offpeak", q.offpeak), ("peak", q.peak)):
+                print(f"    {q.state} {name}: n_eff={q.n_eff:.2f} unresolved={q.unresolved} "
+                      f"warm={window.successes}/{window.attempts} "
+                      f"med={_fmt(window.median)} p90={_fmt(window.p90)} p95={_fmt(window.p95)}")
     if len(out.kept) > cfg.pool_max - cfg.trim_headroom:
         print(f"rank: note: pool size {len(out.kept)} > POOL_MAX−headroom {cfg.pool_max - cfg.trim_headroom}; "
               f"rule 4 trims <= {cfg.trim_headroom} characterized IPs per run")
@@ -854,10 +1047,42 @@ def main(argv: list[str] | None = None) -> int:
         print(f"rank: WARNING eligible publish set < {cfg.publish_top_n}; best not rewritten", file=sys.stderr)
 
     if not args.dry_run:
+        if reference:
+            capacity = {ip for ip, why in out.evicted if why == "overflow"}
+            evicted_rows = [replace(c, evaluated_at=out.evaluations.get(c.ip, "-"))
+                            for c in contenders if c.ip in capacity]
+            write_lifecycle(lifecycle_path, reference, lifecycle, new_rows, evicted_rows, now)
+        publication = previous_publication
+        if (evidence is not None and guard == "none" and published
+                and (write_best_file or (reference and batch_id))):
+            from dns_selection import batch_order, choose
+
+            members = published[:cfg.publish_top_n]
+            previous = previous_choice
+            if not previous.active:
+                previous = replace(previous, active=incumbents[0] if incumbents else members[0])
+            if reference and batch_id:
+                eligible = {r.ip for r in out.ranked if publish_eligible(r, cfg, evicted_ips)}
+                rejected = evicted_ips | {r.ip for r in out.ranked if r.stats.quality.state == "ineligible"}
+                order = [r.ip for r in out.ranked]
+                fresh = {ip for ip in eligible if any(b.run == batch_id for b in by_ip[ip].stats.quality.usable)}
+                if previous.active in rejected or previous.active not in members:
+                    eligible = fresh
+                winner = next((ip for ip in order if ip in eligible and ip in members), "")
+                if winner in fresh and batch_order(batch_id) > batch_order(previous.last_batch):
+                    if previous.reference != reference:
+                        previous = replace(previous, challenger="")
+                    previous = replace(choose(previous, members, eligible, rejected, order, batch_id),
+                                       reference=reference)
+            if previous.active not in members:
+                previous = replace(previous, active="", challenger="")
+            publication = Publication(tuple(members), previous)
         write_contenders(args.contenders, new_rows)
         if write_best_file:
             kept_set = set(out.kept)
             write_best(args.best, [r for r in out.ranked if r.ip in kept_set], published, now, cfg)
+        if publication is not None and publication != previous_publication:
+            write(publication_path, publication)
         append_blacklist(args.blacklist, [ip for ip, why in out.evicted if why != "overflow"], now)
         record_cooldown(capacity_path, [ip for ip, why in out.evicted if why == "overflow"],
                         now, args.capacity_cooldown_hours)

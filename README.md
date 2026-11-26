@@ -2,13 +2,17 @@
 
 移动 HKG 方向 Cloudflare CDN IP 自动优选。每 5 分钟做 TCP 延迟候选发现；每 2 小时对整个 contender 池做完整 VLESS+WS+TLS TTFB 审计，每 15 分钟对 core/challenger 复采样；rank.py 以半衰期加权统计 + 不确定性区间排名，淘汰只凭证据，发布带滞回。目标：真正优秀的 IP 尽快浮出水面，旧的中庸 IP 不长期占位，候选不因随机丢弃而消失。Cloudflare 下载测速不参与准入、淘汰或评分。
 
+设计与决策记录：
+- docs/superpowers/specs/2026-10-15-contender-pool-design.md（算法与契约）
+- docs/decisions/2026-10-15-contender-pool-shadow.md（影子期与切换）
+
 ## 公开版本说明（脱敏）
 
 本仓库是私有生产系统的公开镜像，已做以下处理，因此**不是可直接部署的副本**：
 
-- 中继域名（模板 SNI/HOST 与 MiSub 地址）替换为 `example.com` 占位符，需自行填写；
+- 节点模板 SNI/HOST、MiSub 订阅地址和 DNS 记录名使用 `example.com` 示例，DNS 区域标识也使用占位值；
 - 凭据不随仓库分发：`secrets/misub.env`、`secrets/vless.env` 需本机自建并保持 `0600`；
-- 运行状态（候选池、历史、发布集、冷却、分层、`ip_ranges.txt`）不包含在内；
+- 运行状态（候选池、历史、发布快照、冷却、分层和 `ip_ranges.txt`）不包含在内；
 - 回放夹具中的实测地址已改写为私有网段，仅保留时间与状态结构。
 
 `tests/test_distribution_contract.py` 会阻止上述内容被重新引入。
@@ -29,7 +33,7 @@
 ├── rank.py               # 池统计、分层、淘汰、粘性发布 → contenders.tsv / best_ips.txt / .tiers/
 ├── admission.py          # 发现队列维护、快筛选择与限额准入，保留候选验证状态
 ├── cooldown.py           # 质量/容量冷却有效期与原子写入
-├── replay.py             # 用历史 vless_history 回放 rank 策略（离线评估）
+├── replay.py             # 按参考路径和历史截止时间回放结构化请求观测
 ├── scan_latency.sh       # 高频 TCP 延迟发现 → discovered_ips.tsv
 ├── probation.py          # 仅保留 _median_ms 契约（segment_quality.py 复用）
 ├── segment_quality.py    # /24、/16 网段级历史定性，拦截明确劣段
@@ -37,7 +41,7 @@
 ├── verify_vless.sh       # VLESS 真实链路 TTFB 门控（并行批次验证）
 ├── watchdog.sh           # Top1 连通性监测 → cycle.sh fast --emergency
 ├── publish_watchdog.sh   # 发布链路停摆告警（Hermes no-agent 定时调用）
-├── apply.sh              # best_ips 变化检测 → push_to_misub
+├── apply.sh              # 从同一份期望发布快照协调 DNS 和 MiSub
 ├── probe.sh              # MTR 路径诊断 → routes.tsv
 ├── status.py             # 只读运行状态汇总（./status.py 或 --json）
 ├── migrate.sh / rollback.sh  # 旧链路 ⇄ contender 池 切换与回滚
@@ -163,7 +167,7 @@ cd /opt/cfst
 bash run.sh                        # 手动慢周期（= cycle.sh slow）
 ./cycle.sh fast                    # 手动快周期
 python3 rank.py --dry-run          # 只算不写（best/contenders 不变；需 config.sh 阈值，见 cycle.sh 调用）
-python3 replay.py --help           # 用历史回放策略
+python3 replay.py --help           # 只读回放，需 --observations、--reference 和 --now
 ./verify_vless.sh                  # 验证当前 Top N
 ./verify_vless.sh --audit <(cut -f1 contenders.tsv | grep -v '^#')  # 审计全池
 ./probe.sh --top 5                 # MTR Top 5
@@ -173,7 +177,9 @@ cat best_ips.txt                   # 当前排名与发布集
 
 ## 消费方式
 
-`best_ips.txt` 末尾 `# --- BEST_IPS` 段为纯 IP 列表，供 apply.sh 推送到 misub。
+自动发布每次读取一份 `.publish_desired.json`，从中确定 DNS 目标和 MiSub 有序成员，并以这些目标计算应用指纹。排名原子更新快照。`best_ips.txt` 继续输出榜单及末尾 `# --- BEST_IPS` 纯 IP 段。
+
+升级时须持有周期、应用和验证锁，从当前榜单及 `.dns_preference.json` 初始化快照，并比对迁移前后的两路目标和指纹；不要以主动推送代替比对。回滚时须在同一组锁内将最新快照投影回旧格式，并重新比对。两种操作都保留 `.apply_state` 和 `.apply_state.pending`。
 
 ShellCrash 每小时从 misub 拉取订阅并重启 Mihomo，无需本地 provider YAML 热加载。
 

@@ -1,82 +1,60 @@
 #!/usr/bin/env python3
-"""
-replay.py — 只读回放工具：按日滚动窗口终点调用 rank.run_rank，输出每日 Top3 与变化次数。
-
-用法：replay.py --history FILE [--days 5] [--now TS] [--contenders FILE] [rank 阈值参数…]
-池 = --contenders（若给出）否则 history 中出现过的全部 IP。不写任何文件。
-"""
+"""Read-only replay of retained request observations at a historical cutoff."""
 from __future__ import annotations
 
 import argparse
-import sys
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import rank  # noqa: E402
+import rank
+from quality_evidence import assess, load_batches
 
 
 @dataclass(frozen=True)
 class Day:
     end: datetime
     top3: list[str]
-    samples: int
+    batches: int
+    quality: dict[str, str]
+    strength: list[str]
 
 
-@dataclass(frozen=True)
-class Replay:
-    days: list[Day]
-    changes: int
-
-
-def last_timestamp(path: Path) -> datetime | None:
-    last: datetime | None = None
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            ts = rank.parse_ts(line.split("\t", 1)[0])
-            if ts is not None and (last is None or ts > last):
-                last = ts
-    return last
-
-
-def replay(history: Path, days: int, cfg: rank.Config, now: datetime | None = None,
-           pool: list[str] | None = None) -> Replay:
-    end = now or last_timestamp(history)
-    if end is None:
-        return Replay([], 0)
-    out: list[Day] = []
-    incumbents: list[str] = []
+def replay(observations: Path, reference: str, days: int, cfg: rank.Config,
+           now: datetime, pool: list[str] | None = None) -> list[Day]:
+    out = []
+    incumbents = []
     for i in range(days - 1, -1, -1):
-        day_end = end - timedelta(days=i)
-        samples = rank.load_history(history, day_end, cfg.window_days)
-        day_pool = pool if pool is not None else sorted({s.ip for s in samples})
-        res = rank.run_rank(samples, day_pool, incumbents, day_end, cfg, guard="none")
-        top3 = (res.published or incumbents)[: cfg.publish_top_n]
-        incumbents = top3
-        out.append(Day(day_end, top3, len(samples)))
-    changes = sum(1 for i in range(1, len(out)) if out[i].top3 != out[i - 1].top3)
-    return Replay(out, changes)
+        end = now - timedelta(days=i)
+        batches = load_batches(observations, end, reference)
+        day_pool = sorted({b.ip for b in batches}) if pool is None else pool
+        result = rank.run_rank([], day_pool, incumbents, end, cfg,
+                               evidence=batches, reference=reference)
+        incumbents = result.published or incumbents
+        quality = {ip: assess(batches, ip, reference, end).state for ip in day_pool}
+        out.append(Day(end, incumbents, len(batches), quality, [r.ip for r in result.ranked]))
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="rank replay (read-only)")
-    p.add_argument("--history", type=Path, required=True)
-    p.add_argument("--days", type=int, default=5)
-    p.add_argument("--now", default=None, help="窗口终点，默认 history 最后一行时间")
-    p.add_argument("--contenders", type=Path, default=None)
+    p = argparse.ArgumentParser(description="structured evidence replay (read-only)")
+    p.add_argument("--observations", type=Path, required=True)
+    p.add_argument("--reference", required=True, help="参考路径 SHA-256")
+    p.add_argument("--now", required=True, help="历史截止时间 YYYY-MM-DD HH:MM:SS")
+    p.add_argument("--days", type=int, default=1)
+    p.add_argument("--contenders", type=Path)
     rank.add_config_args(p)
     args = p.parse_args(argv)
-    cfg = rank.config_from_args(args)
-    now = rank.parse_ts(args.now) if args.now else None
-    if args.now and now is None:
-        print(f"replay: invalid --now {args.now!r}", file=sys.stderr)
-        return 2
+    now = rank.parse_ts(args.now)
+    if now is None or not re.fullmatch(r"[a-f0-9]{64}", args.reference) or not 1 <= args.days <= 7:
+        p.error("invalid cutoff, reference key, or replay day count")
     pool = [c.ip for c in rank.read_contenders(args.contenders)] if args.contenders else None
-    res = replay(args.history, args.days, cfg, now, pool)
-    for d in res.days:
-        print(f"{d.end.strftime(rank.TS_FORMAT)}  samples={d.samples:<5d} top3={','.join(d.top3) or '-'}")
-    print(f"replay: days={len(res.days)} changes={res.changes}")
+    for day in replay(args.observations, args.reference, args.days, rank.config_from_args(args), now, pool):
+        print(f"{day.end:{rank.TS_FORMAT}} batches={day.batches} proposed={','.join(day.top3) or '-'}")
+        print("strength=" + ",".join(day.strength))
+        print("quality=" + ",".join(f"{ip}:{state}" for ip, state in sorted(day.quality.items())))
+    print("historical_guard=unreconstructable actual_dns=unreconstructable actual_misub=unreconstructable")
     return 0
 
 

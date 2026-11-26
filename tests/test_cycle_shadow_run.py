@@ -18,6 +18,9 @@ apply.sh / probe.sh 全部为桩（桩的留痕写到 tmp_path/stub，不污染�
 """
 from __future__ import annotations
 
+from publication_snapshot import Publication, write
+from quality_evidence import Batch, Request, load_batches, store_batches
+
 import fcntl
 import os
 import re
@@ -46,7 +49,8 @@ APPLY_STATE = "deadbeefdeadbeef\n"
 # 影子轮允许变化/新增的沙箱内路径（vless_history.tsv 按设计由 audit 共享追加）
 SHADOW_WRITES = {
     ".shadow/contenders.tsv", ".shadow/best_ips.txt", ".shadow/blacklist.tsv",
-    ".tiers/core.txt", ".tiers/challengers.txt", "vless_history.tsv",
+    ".tiers/core.txt", ".tiers/challengers.txt", "vless_history.tsv", "vless_history.tsv.requests.jsonl",
+    ".shadow/.publish_desired.json", ".shadow/contenders.tsv.lifecycle.json",
 }
 
 CONFIG_TEMPLATE = """\
@@ -87,7 +91,8 @@ VLESS_SCREEN_MAX_FAIL=3
 publish_set() {{
   sed -n '/^# --- BEST_IPS/,$ {{ /^[0-9]/ p }}' "$BEST" | head -n "$PUBLISH_TOP_N"
 }}
-compute_apply_state() {{ publish_set | md5sum | cut -d' ' -f1; }}
+read_publish_targets() {{ python3 "$CFST_DIR/publication_snapshot.py" targets "${{BEST%/*}}/.publish_desired.json"; }}
+compute_apply_state() {{ read_publish_targets | md5sum | cut -d' ' -f1; }}
 vless_screen_admit_ttfb() {{ echo 100; }}
 """
 
@@ -111,6 +116,15 @@ case "${1:-}" in
       echo "  $ip  PASS"
       printf '%s\\t%s\\tPASS\\t50\\t\\n' "$ts" "$ip" >> "$H"
     done < "$IN"
+    if [ -n "${VLESS_AUDIT_RUN:-}" ]; then
+      ref=$(printf '%064d' 1)
+      mapfile -t ips < "$IN"
+      python3 "$D/audit_evidence.py" bind "$VLESS_REFERENCE_OUT" "$VLESS_AUDIT_RUN" "$ref" "${ips[@]}"
+      for ip in "${ips[@]}"; do
+        printf '%s\\t%s\\t0\\t200\\t0.050\\t0|1\\t200\\t0.050\\t0\\n' "$ts" "$ip"
+      done | python3 "$D/audit_evidence.py" record "$H.requests.jsonl" "$VLESS_REFERENCE_OUT" \\
+        "$VLESS_AUDIT_RUN" "$ref" 1 "${ips[@]}"
+    fi
     ;;
   --screen) touch "$STUB_OUT/screen_called"; exit 0 ;;
   *) echo "verify stub: unexpected args: $*" >&2; exit 64 ;;
@@ -142,16 +156,19 @@ class Sandbox:
         self.stub.mkdir()
         (self.sb / "results").mkdir()
         (self.sb / ".shadow").mkdir()
-        for name in ("cycle.sh", "rank.py", "ip_validation.py", "cycle_result.py", "atomic_io.py", "cooldown.py", "admission.py"):
+        for name in ("cycle.sh", "rank.py", "ip_validation.py", "cycle_result.py", "atomic_io.py",
+                     "cooldown.py", "admission.py", "quality_evidence.py", "audit_evidence.py",
+                     "dns_selection.py", "systemic.py", "publication_snapshot.py"):
             shutil.copy(ROOT / name, self.sb / name)
         (self.sb / "cycle.sh").chmod(0o755)
         (self.sb / "config.sh").write_text(CONFIG_TEMPLATE.format(sb=self.sb), encoding="utf-8")
         _exe(self.sb / "verify_vless.sh", VERIFY_STUB)
         _exe(self.sb / "apply.sh", APPLY_STUB)
         _exe(self.sb / "probe.sh", PROBE_STUB)
-        (self.sb / "systemic.py").write_text(SYSTEMIC_STUB, encoding="utf-8")
         # 旧链路状态（影子下必须逐字节不变）
         (self.sb / "best_ips.txt").write_text(LEGACY_BEST, encoding="utf-8")
+        from publication_snapshot import migrate
+        migrate(self.sb / "best_ips.txt", len(LEGACY_PUBLISHED))
         (self.sb / "discovered_ips.tsv").write_text(DISCOVERED, encoding="utf-8")
         (self.sb / ".screen_blacklist.tsv").write_text(SCREEN_BLACKLIST, encoding="utf-8")
         (self.sb / ".apply_state").write_text(APPLY_STATE, encoding="utf-8")
@@ -161,7 +178,16 @@ class Sandbox:
             "# contenders.tsv — ip<TAB>first_seen<TAB>last_sampled<TAB>origin\n"
             + "".join(f"{ip}\t2026-10-01 00:00:00\t2026-10-01 00:00:00\tmaster\n" for ip in POOL),
             encoding="utf-8")
-        (self.sb / "vless_history.tsv").write_text(_history(datetime.now()), encoding="utf-8")
+        now = datetime.now()
+        (self.sb / "vless_history.tsv").write_text(_history(now), encoding="utf-8")
+        observations = []
+        ref = "0" * 63 + "1"
+        for minutes in range(10, 48 * 60, 10):
+            at = now - timedelta(minutes=minutes)
+            if 20 <= at.hour < 24:
+                observations.extend(Batch(at, f"seed-{minutes}", ref, ip, (Request("ok", 50),) * 2)
+                                    for ip in POOL)
+        store_batches(self.sb / "vless_history.tsv.requests.jsonl", observations, now)
 
     # ── 运行 ──
     def env(self) -> dict[str, str]:
@@ -244,7 +270,8 @@ def _assert_common_contract(sandbox: Sandbox, proc: subprocess.CompletedProcess[
         assert data['shadow'] is True and data['state']=='completed'
         assert data['application']=='shadow_skipped'
 
-    assert set(p.name for p in (sandbox.sb / ".shadow").iterdir()) <= {"contenders.tsv", "best_ips.txt", "blacklist.tsv", "cycle-results"}
+    assert set(p.name for p in (sandbox.sb / ".shadow").iterdir()) <= {"contenders.tsv", "best_ips.txt", "blacklist.tsv", "cycle-results",
+                    ".publish_desired.json", "contenders.tsv.lifecycle.json"}
 
 
 def test_slow_then_fast_shadow(sandbox: Sandbox) -> None:
@@ -259,14 +286,17 @@ def test_slow_then_fast_shadow(sandbox: Sandbox) -> None:
     hist = (sandbox.sb / "vless_history.tsv").read_text(encoding="utf-8").splitlines()
     assert len(hist) == len(POOL) * (len(PRESEED_AGES_H) + 1)
 
-    # RANK_NOW 在 audit 之后取样：预置 6 条 ≈ 5.62 < 6 不可发布；计入本轮 1 条后 ≥ 6.5 才进 best
+    # 本轮原始观测进入 rank，且旧 TSV 仍可作为历史记录读取。
+    record = next((sandbox.sb / ".shadow/cycle-results").glob("cycle-*.json"))
+    run = record.stem.removeprefix("cycle-")
+    batches = load_batches(sandbox.sb / "vless_history.tsv.requests.jsonl", datetime.now())
+    assert {b.ip for b in batches if b.run == run} == set(POOL)
     rows = sandbox.shadow_best_rows()
-    assert set(rows) == set(POOL), rows
-    for ip, parts in rows.items():
-        assert float(parts[4]) >= 6.5, f"{ip} n_eff={parts[4]}：本轮 audit 样本未被 rank 计入"
+    assert len(rows) == 3 and set(rows) <= set(POOL), rows
+    assert all(float(parts[4]) >= 8 for parts in rows.values()), rows
     best_text = (sandbox.sb / ".shadow" / "best_ips.txt").read_text(encoding="utf-8")
-    machine = best_text.split(BEST_MARKER, 1)[1].strip().splitlines()
-    assert sorted(machine) == POOL
+    machine = [row for row in best_text.split(BEST_MARKER, 1)[1].splitlines() if row and not row.startswith("#")]
+    assert len(machine) == 3 and set(machine) <= set(POOL)
     # 池未淘汰 → 不产生影子黑名单；contenders 的 last_sampled 已更新为本轮 audit 时间
     assert not (sandbox.sb / ".shadow" / "blacklist.tsv").exists()
     cont = [ln.split("\t") for ln in (sandbox.sb / ".shadow" / "contenders.tsv").read_text().splitlines()
@@ -286,7 +316,7 @@ def test_slow_then_fast_shadow(sandbox: Sandbox) -> None:
     assert len(inputs) == 2
     assert inputs[1] == core + [ip for ip in chal if ip not in core]
     rows = sandbox.shadow_best_rows()
-    assert all(float(parts[4]) >= 7.5 for parts in rows.values()), rows
+    assert all(float(parts[4]) >= 8 for parts in rows.values()), rows
 
 
 
@@ -391,6 +421,37 @@ def test_live_slow_verified_apply_runs_probe(sandbox: Sandbox) -> None:
     assert BEST_MARKER in best and "legacy best_ips" not in best, "生产轮必须重写 best_ips.txt"
     assert (sandbox.sb / "contenders.tsv").read_text(encoding="utf-8").count("\n") >= len(POOL)
     assert not (sandbox.sb / ".shadow").exists()
+
+
+def test_live_fast_rejects_short_snapshot_without_applying(sandbox: Sandbox) -> None:
+    _go_live(sandbox)
+    path = sandbox.sb / ".publish_desired.json"
+    from dns_selection import Choice
+
+    write(path, Publication(tuple(LEGACY_PUBLISHED[:2]), Choice(LEGACY_PUBLISHED[0])))
+    tiers = sandbox.sb / ".tiers"
+    tiers.mkdir()
+    (tiers / "core.txt").write_text("\n".join(POOL) + "\n")
+
+    # Ensure a clean audit could otherwise replace the short snapshot at any time of day.
+    now = datetime.now()
+    ref = "0" * 63 + "1"
+    observations = [Batch(now - timedelta(hours=age), f"complete-{age}", ref, ip, (Request("ok", 50),) * 2)
+                    for age in range(1, 25) for ip in POOL]
+    store_batches(sandbox.sb / "vless_history.tsv.requests.jsonl", observations, now)
+    protected = [path, sandbox.sb / "best_ips.txt", sandbox.sb / ".apply_state"]
+    before = [file.read_bytes() for file in protected]
+
+    proc = sandbox.run("fast")
+
+    assert sandbox.audit_inputs() == [POOL]
+    assert "audit_ok=1 systemic=0 guard=none" in proc.stdout
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "rank: invalid publication snapshot" in proc.stdout
+    assert "configured member count" in proc.stdout
+    assert sandbox.markers() == set()
+    assert [file.read_bytes() for file in protected] == before
+    assert not (sandbox.sb / ".apply_state.pending").exists()
 
 
 def test_live_slow_apply_state_mismatch_fails_closed_and_skips_probe(sandbox: Sandbox, monkeypatch) -> None:

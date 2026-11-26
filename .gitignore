@@ -1,6 +1,7 @@
 # ── 凭据（0600，绝不入库）
 secrets/
 backups/
+.env
 
 # ── 二进制依赖（cfst / xray，运行时自备）
 cfst
@@ -15,10 +16,18 @@ master_state.tsv
 probation_pool.tsv
 routes.tsv
 vless_history.tsv
+vless_history.tsv.requests.jsonl
+contenders.tsv.lifecycle.json
+.publish_desired.json
+.dns_preference.json
+.quality_evidence_enabled
+.misub-reconcile-pending.json
+ip_ranges.txt
 segment_verdicts.tsv
 .segment_verdicts.tsv.tmp.*
 .apply_cooldown
 .apply_state
+.apply_state.pending
 .apply.lock
 .probe.lock
 .push_disabled

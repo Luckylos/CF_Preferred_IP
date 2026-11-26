@@ -74,7 +74,7 @@ ADMITTED=0
 SCREEN_FAILED=0
 PROBE_FAILED=0
 CYCLE_INTERRUPTED=0
-AUDIT_IN=""; AUDIT_OUT=""; RANK_OUT=""; RANK_JSON=""
+AUDIT_IN=""; AUDIT_OUT=""; AUDIT_REF=""; RANK_OUT=""; RANK_JSON=""
 SCREEN_IN=""; SCREEN_OUT=""; POOL_SET=""; NEW_ROWS=""
 cycle_exit() {
   local result=$?
@@ -97,7 +97,7 @@ cycle_exit() {
     fi
   fi
   local file
-  for file in "$AUDIT_IN" "$AUDIT_OUT" "$RANK_OUT" "$RANK_JSON" "$SCREEN_IN" "$SCREEN_OUT" "$POOL_SET" "$NEW_ROWS"; do
+  for file in "$AUDIT_IN" "$AUDIT_OUT" "$AUDIT_REF" "$RANK_OUT" "$RANK_JSON" "$SCREEN_IN" "$SCREEN_OUT" "$POOL_SET" "$NEW_ROWS"; do
     if [ -n "$file" ]; then
       if rm -f "$file"; then :; else if [ "$result" = "0" ]; then result=1; fi; fi
     fi
@@ -116,6 +116,7 @@ CYCLE_ID=$(tail -n1 <<< "$BEGIN_RESULT")
 log "cycle-record: id=$CYCLE_ID"
 AUDIT_IN=$(mktemp "$RESULT_DIR/.audit-in.XXXXXX")
 AUDIT_OUT=$(mktemp "$RESULT_DIR/.audit.XXXXXX")
+AUDIT_REF=$(mktemp "$RESULT_DIR/.audit.ref.XXXXXX")
 RANK_OUT=$(mktemp "$RESULT_DIR/.rank.XXXXXX")
 RANK_JSON=$(mktemp "$RESULT_DIR/.rank-result.XXXXXX")
 SCREEN_IN=$(mktemp "$RESULT_DIR/.screen-in.XXXXXX")
@@ -162,26 +163,44 @@ if [ "$MODE" = "slow" ]; then
   # ── audit 输入 = 全池 ──
   pool_ips > "$AUDIT_IN"
 else
-  # ── audit 输入 = 上轮 rank 产出的 core ∪ challengers（去重）──
-  if [ ! -f "$TIERS_DIR/core.txt" ] && [ ! -f "$TIERS_DIR/challengers.txt" ]; then
+  audit_limit=20
+  emergency_audit=0
+  if [ "$EMERGENCY" = "1" ] && [ "$SHADOW" = "0" ]; then
+    emergency_audit=1
+  fi
+  # 紧急轮先复测发布目标，有无 tiers 都不影响这一步。
+  if [ "$emergency_audit" = "0" ] && [ ! -f "$TIERS_DIR/core.txt" ] && [ ! -f "$TIERS_DIR/challengers.txt" ]; then
     log "fast: no tiers at $TIERS_DIR (core.txt/challengers.txt); nothing to audit"
     finish_line
     exit 0
   fi
-  # 逐文件读（任一缺失不影响另一个）；子 shell 以 true 收尾，避免 pipefail 把"缺文件"当管道失败清空输入。
-  (for f in "$TIERS_DIR/core.txt" "$TIERS_DIR/challengers.txt"; do [ -f "$f" ] && cat "$f"; done; true) \
+  (if [ "$emergency_audit" = "1" ]; then
+     read_publish_targets || exit 1
+   fi
+   for f in "$TIERS_DIR/core.txt" "$TIERS_DIR/challengers.txt"; do [ -f "$f" ] && cat "$f"; done; true) \
     | grep -E '^[0-9]' | python3 "$CFST_DIR/ip_validation.py" --filter \
-    | awk 'NF && !seen[$0]++' > "$AUDIT_IN" || : > "$AUDIT_IN"
+    | awk -v limit="$audit_limit" 'NF && !seen[$0]++ && (!limit || count++ < limit)' > "$AUDIT_IN" || : > "$AUDIT_IN"
+  if [ "$emergency_audit" = "1" ] && [ ! -s "$AUDIT_IN" ]; then
+    log "fast emergency: no valid addresses to audit"
+    finish_line
+    exit 1
+  fi
 fi
+awk 'NF && !seen[$0]++' "$AUDIT_IN" > "$POOL_SET"
+cat "$POOL_SET" > "$AUDIT_IN"
 AUDIT_REQUESTED=$(awk 'END{print NR+0}' "$AUDIT_IN")
+OBSERVATIONS="${VLESS_HISTORY:-$CFST_DIR/vless_history.tsv}.requests.jsonl"
 AUDIT_REQUESTED=$((10#$AUDIT_REQUESTED))
 
 # ── audit（verify_vless --audit：只报告，不改写；样本追加到 VLESS_HISTORY）──
 AUDIT_OK=1
 AUDIT_RC=0
+AUDIT_START_NS=0
 if (( AUDIT_REQUESTED > 0 )) && [ -x "$CFST_DIR/verify_vless.sh" ]; then
   log "$MODE audit (VLESS): targets=$AUDIT_REQUESTED"
-  "$CFST_DIR/verify_vless.sh" --audit "$AUDIT_IN" > "$AUDIT_OUT" 2>> "$LOG" || AUDIT_RC=$?
+  AUDIT_START_NS=$(date +%s%N)
+  VLESS_REFERENCE_OUT="$AUDIT_REF" VLESS_AUDIT_RUN="$CYCLE_ID" \
+    "$CFST_DIR/verify_vless.sh" --audit "$AUDIT_IN" > "$AUDIT_OUT" 2>> "$LOG" || AUDIT_RC=$?
 else
   log "$MODE audit skipped: targets=$AUDIT_REQUESTED"
   AUDIT_OK=0
@@ -203,40 +222,38 @@ case "$AUDIT_RC" in
     ;;
 esac
 
-# ── 系统性劣化守卫：共因故障轮不得转化为 IP 级处罚（fail-open：异常回落 0）──
-SYSTEMIC_ROUND=0
-if [ -s "$AUDIT_OUT" ] && [ -f "$CFST_DIR/systemic.py" ]; then
-  SYSTEMIC_ROUND=$(python3 "$CFST_DIR/systemic.py" \
-    --audit "$AUDIT_OUT" \
-    --p10-threshold "${MASTER_SYSTEMIC_P10_MS:?MASTER_SYSTEMIC_P10_MS is required}" \
-    --min-samples "${MASTER_SYSTEMIC_MIN_SAMPLES:?MASTER_SYSTEMIC_MIN_SAMPLES is required}" \
-    2>> "$LOG" || printf '0\n')
-  case "$SYSTEMIC_ROUND" in 0|1) ;; *) SYSTEMIC_ROUND=0 ;; esac
+# 覆盖与共因守卫都来自经收据核对的结构化观测。
+if [ "$AUDIT_OK" = "1" ]; then
+  AUDIT_FACTS=$(python3 "$CFST_DIR/audit_evidence.py" facts "$OBSERVATIONS" "$AUDIT_REF" \
+    "$CYCLE_ID" "$AUDIT_IN" "$AUDIT_START_NS" "$MASTER_MIN_COVERAGE_PERCENT" \
+    "$MASTER_SYSTEMIC_P10_MS" "$MASTER_SYSTEMIC_MIN_SAMPLES")
+  read -r GUARD AUDIT_REQUESTED AUDIT_RETURNED _ <<< "$AUDIT_FACTS"
+else
+  GUARD=no_evidence
+  AUDIT_RETURNED=0
 fi
-
-# 证据格式和非统计守卫只由同一module解释。
-AUDIT_FACTS=$(python3 "$CFST_DIR/cycle_result.py" audit --path "$AUDIT_OUT" \
-  --requested "$AUDIT_REQUESTED" --ok "$AUDIT_OK" --systemic "$SYSTEMIC_ROUND" \
-  --percent "$MASTER_MIN_COVERAGE_PERCENT")
-read -r AUDIT_RETURNED MIN_ROWS GUARD <<< "$AUDIT_FACTS"
+[ "$GUARD" != "no_evidence" ] || AUDIT_OK=0
+[ "$GUARD" != "systemic" ] || SYSTEMIC_ROUND=1
+MIN_ROWS=$(( (AUDIT_REQUESTED * MASTER_MIN_COVERAGE_PERCENT + 99) / 100 ))
 AUDIT_READY=1
-# rank 的 --now 必须在 audit 之后取样：窗口为 (now-7d, now]，否则本轮样本全部落在窗口外。
 RANK_NOW=$(date '+%F %T')
 log "audit evidence: returned=$AUDIT_RETURNED/$AUDIT_REQUESTED (need >=$MIN_ROWS) audit_ok=$AUDIT_OK systemic=$SYSTEMIC_ROUND guard=$GUARD"
 
-# ── 排名（history 驱动）：更新 contenders.tsv / best_ips.txt / .tiers ──
+rank_options=()
+if [ "$SHADOW" = "1" ]; then
+  rank_options+=(--initialize-publication)
+fi
 set +e
-python3 "$CFST_DIR/rank.py" \
-  --history "${VLESS_HISTORY:-$CFST_DIR/vless_history.tsv}" \
+python3 "$CFST_DIR/rank.py" "${rank_options[@]}" --observations "$OBSERVATIONS" \
+  --reference-file "$AUDIT_REF" --audit-start-ns "$AUDIT_START_NS" \
+  --audit-run "$CYCLE_ID" --audit-targets "$AUDIT_IN" \
+  --audit-p10-ms "$MASTER_SYSTEMIC_P10_MS" --audit-min-samples "$MASTER_SYSTEMIC_MIN_SAMPLES" \
   --contenders "$CONTENDERS" \
   --best "$BEST" \
   --blacklist "$SCREEN_BLACKLIST" \
   --capacity-cooldown "$CAPACITY_COOLDOWN" \
   --capacity-cooldown-hours "$CAPACITY_COOLDOWN_HOURS" \
   --now "$RANK_NOW" \
-  --audit-requested "$AUDIT_REQUESTED" \
-  --audit-returned "$AUDIT_RETURNED" \
-  --systemic "$SYSTEMIC_ROUND" \
   --audit-ok "$AUDIT_OK" \
   --result-out "$RANK_JSON" \
   --audit-min-coverage-percent "$MASTER_MIN_COVERAGE_PERCENT" \
@@ -269,11 +286,14 @@ if (( rank_rc != 0 )); then
   finish_line
   exit "$rank_rc"
 fi
-if RANK_SUMMARY=$(python3 "$CFST_DIR/cycle_result.py" receipt --path "$RANK_JSON"); then
+if RANK_SUMMARY=$(python3 "$CFST_DIR/cycle_result.py" receipt --path "$RANK_JSON") &&
+   RANK_GUARD=$(python3 "$CFST_DIR/cycle_result.py" receipt --path "$RANK_JSON" --guard) &&
+   { [ "$GUARD" = "$RANK_GUARD" ] || { [ "$GUARD" = "none" ] && [ "$RANK_GUARD" = "no_evidence" ]; }; }; then
+  GUARD=$RANK_GUARD
   log "$RANK_SUMMARY"
 else
   RANK_STATUS=failed
-  log "rank receipt missing or invalid; refusing further apply"
+  log "rank receipt missing, invalid or inconsistent with audit evidence; refusing further apply"
   finish_line
   exit 1
 fi
@@ -281,8 +301,11 @@ RANK_STATUS=ok
 
 # ── 应用优选结果到订阅服务（shadow 不发布）──
 if [ "$SHADOW" = "0" ]; then
-  if [ -x "$CFST_DIR/apply.sh" ]; then
-    if APPLY_FORCE=1 "$CFST_DIR/apply.sh"; then
+  # 发布落地由 apply.sh 负责：CFST_PUBLISH=dns 时写 DNS，misub 模式沿用旧推送。
+  retry_only=0
+  [ "$GUARD" = "none" ] || retry_only=1
+  if [ -x "$CFST_DIR/apply.sh" ] && { [ "$retry_only" = "0" ] || [ -e "$APPLY_STATE.pending" ]; }; then
+    if APPLY_FORCE=1 APPLY_RETRY_ONLY="$retry_only" "$CFST_DIR/apply.sh"; then
       :
     else
       apply_rc=$?
@@ -292,28 +315,28 @@ if [ "$SHADOW" = "0" ]; then
       exit "$apply_rc"
     fi
   fi
-  APPLICATION=not_required
-  # 发布集/模板变化必须真正推送成功；状态公式单点来自 config.sh compute_apply_state。
-  if [ -s "$BEST" ]; then
-    APPLICATION=unconfirmed
-    if [ ! -f "$APPLY_STATE" ]; then
-      if [ -f "$CFST_DIR/.push_disabled" ]; then
-        log "apply skipped by maintenance gate; no verified state, refusing further steps"
-      else
-        log "apply state missing at $APPLY_STATE; refusing further steps"
-      fi
-      finish_line
-      exit 1
+  APPLICATION=unconfirmed
+  if [ ! -f "$APPLY_STATE" ]; then
+    if [ -f "$CFST_DIR/.push_disabled" ]; then
+      log "apply skipped by maintenance gate; no verified state, refusing further steps"
+    else
+      log "apply state missing at $APPLY_STATE; refusing further steps"
     fi
-    TOP_STATE=$(compute_apply_state)
-    APPLIED_STATE=$(cat "$APPLY_STATE" 2>/dev/null || true)
-    if [ "$TOP_STATE" != "$APPLIED_STATE" ]; then
-      log "apply state mismatch after ranking at $APPLY_STATE; refusing further steps"
-      finish_line
-      exit 1
-    fi
-    APPLICATION=confirmed
+    finish_line
+    exit 1
   fi
+  if ! TOP_STATE=$(compute_apply_state); then
+    log "desired publication state unavailable; refusing further steps"
+    finish_line
+    exit 1
+  fi
+  APPLIED_STATE=$(cat "$APPLY_STATE" 2>/dev/null || true)
+  if [ -e "$APPLY_STATE.pending" ] || [ "$TOP_STATE" != "$APPLIED_STATE" ]; then
+    log "apply state mismatch after ranking at $APPLY_STATE; refusing further steps"
+    finish_line
+    exit 1
+  fi
+  APPLICATION=confirmed
 else
   APPLICATION=shadow_skipped
   log "shadow: apply skipped"
@@ -328,8 +351,8 @@ if [ "$MODE" = "slow" ]; then
   pool_ips > "$POOL_SET"
   CONTENDER_COUNT=$(awk 'END{print NR+0}' "$POOL_SET")
   CONTENDER_COUNT=$((10#$CONTENDER_COUNT))
-  if [ "$SYSTEMIC_ROUND" = "1" ]; then
-    log "discovery screen skipped: systemic round"
+  if [ "$GUARD" != "none" ]; then
+    log "discovery screen skipped: $GUARD round"
   elif (( CONTENDER_COUNT >= POOL_MAX )); then
     log "discovery screen skipped: pool full (contenders=$CONTENDER_COUNT >= POOL_MAX=$POOL_MAX)"
   elif [ "$SHADOW" = "1" ]; then

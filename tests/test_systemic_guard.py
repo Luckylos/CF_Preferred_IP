@@ -63,7 +63,7 @@ def code_lines(path: Path) -> str:
     )
 
 
-GUARD_RE = re.compile(r'^if \[ "\$SYSTEMIC_ROUND" = "1" \]; then$')
+GUARD_RE = re.compile(r'^if \[ "\$GUARD" != "none" \]; then$')
 
 
 def guard_regions(code: str) -> list[tuple[int, int]]:
@@ -304,12 +304,12 @@ class TestPunishmentPathsAreGuarded:
         assert re.search(r"^MASTER_SYSTEMIC_MIN_SAMPLES=\d+", config, re.M)
 
     def test_guard_runs_before_rank_and_screen(self) -> None:
-        verdict = self.code.index("systemic.py")
+        verdict = self.code.index("audit_evidence.py")
         assert verdict < self.code.index("rank.py"), "判定必须早于 rank.py"
         assert verdict < self.code.index('--screen "$SCREEN_IN"'), "C: 必须早于发现队列快筛"
 
-    def test_rank_receives_the_verdict(self) -> None:
-        assert '--systemic "$SYSTEMIC_ROUND"' in self.code
+    def test_rank_receives_the_audit_identity(self) -> None:
+        assert '--audit-run "$CYCLE_ID" --audit-targets "$AUDIT_IN"' in self.code
 
     def test_entry_c_discovery_screen_is_skipped(self) -> None:
         """C：systemic 轮不快筛新候选 —— 否则连撞 3 轮就被拉黑 24h。"""
@@ -319,7 +319,7 @@ class TestPunishmentPathsAreGuarded:
 
     def test_guard_verdict_is_computed_before_every_guarded_region(self) -> None:
         lines = self.code.splitlines()
-        assign = next(i for i, ln in enumerate(lines) if ln.strip().startswith("SYSTEMIC_ROUND="))
+        assign = next(i for i, ln in enumerate(lines) if ln.strip().startswith("AUDIT_FACTS="))
         regions = guard_regions(self.code)
         assert regions, "cycle.sh 应有 systemic 守卫区"
         for start, _end in regions:

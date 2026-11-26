@@ -158,8 +158,17 @@ WATCHDOG_MISS_THRESHOLD=3 # Top1 连续 N 次不可达触发 mini 验证
 WATCHDOG_COOLDOWN=3600    # mini 验证冷却秒数（1h）
 WATCHDOG_STATE="$CFST_DIR/.watchdog_state"
 
-# Apply（推送到外部订阅服务）
-APPLY_COOLDOWN=3600       # 推送冷却秒数（1h）
+# Apply（发布落地）
+# dns: 把发布集写成 dns_publish.py 里那个域名的 A 记录，节点地址不再变；
+# misub: 旧路径，按 IP 改写 MiSub 节点 URL。
+# 落地方式：misub（推 IP 到订阅，客户端零 DNS）| dns（写单个域名的 A 记录）| both（两条都落地）
+# both 是 2026-11-24 起的选择：订阅拿 IP 走 MiSub，备用域名 cmcf 只写最好的那 1 个。
+CFST_PUBLISH="${CFST_PUBLISH:-both}"
+if [ -f "$CFST_DIR/.quality_evidence_enabled" ]; then
+  CFST_QUALITY_EVIDENCE="${CFST_QUALITY_EVIDENCE:-1}"
+fi
+CFST_DNS_TOP_N="${CFST_DNS_TOP_N:-1}"   # DNS 只发布最好的前 N 个（默认 1，多一个就多一次客户端解析）
+APPLY_COOLDOWN=3600       # 发布冷却秒数（1h）
 APPLY_STATE="$CFST_DIR/.apply_state"
 
 # ── 发布契约（P3.1 方案 C）────────────────────────────────────────────
@@ -176,11 +185,51 @@ publish_set() {
   sed -n '/^# --- BEST_IPS/,$ { /^[0-9]/ p }' "$BEST" | head -n "$PUBLISH_TOP_N"
 }
 
+dns_preference() {
+  if [ "${CFST_QUALITY_EVIDENCE:-0}" = "1" ] && [ "${CFST_DNS_TOP_N:-1}" = "1" ]; then
+    local choice_file="${BEST%/*}/.dns_preference.json"
+    if [ -f "$choice_file" ]; then
+      python3 "$CFST_DIR/dns_selection.py" "$choice_file"
+    fi
+  fi
+}
+
+# 首行是可选 DNS 发布首选，其余行是同一份快照的有序发布集。
+read_publish_targets() {
+  local flags=()
+  if [ "${CFST_QUALITY_EVIDENCE:-0}" != "1" ] || [ "${CFST_DNS_TOP_N:-1}" != "1" ] || [ "${CFST_PUBLISH:-both}" = "misub" ]; then
+    flags+=(--ignore-preference)
+  fi
+  python3 "$CFST_DIR/publication_snapshot.py" targets "${BEST%/*}/.publish_desired.json" \
+    --count "$PUBLISH_TOP_N" "${flags[@]}"
+}
+
 # 状态键 = 推送模板哈希 + 凭据哈希 + 有序发布集。
 # 顺序参与哈希：push_to_misub 把 rank1/2/3 映射到 CM/CM2/CM3，换序就是换内容，不排序。
 # 缺凭据时用 secret=missing 参与哈希，公式本身不 fail；fail-closed 由调用方决定。
+# 节点 URL 的真正内容由地区模板决定：模板改动（换入口/换 padding）必须触发重新推送，
+# 否则 apply 会以"状态未变"提前退出，订阅永远停在旧入口。
+template_fingerprint() {
+  local key var name
+  for key in HK SG HT; do
+    for var in KEY NAME_PREFIX QUERY SNI HOST PATH FP ALPN LEGACY_INSECURE_FLAGS AUDIT_KEY; do
+      name="CFST_TEMPLATE_${key}_${var}"
+      printf '%s=%s\n' "$name" "${!name}"
+    done
+  done
+}
+
 compute_apply_state() {
-  local template_hash secret_file secret_hash
+  local template_hash secret_file secret_hash preferred members
+  if (( $# == 2 )); then
+    preferred="$1"
+    members="$2"
+  else
+    local targets
+    targets=$(read_publish_targets) || return
+    preferred=${targets%%$'\n'*}
+    members=${targets#*$'\n'}
+  fi
   template_hash=$(sha256sum "$CFST_DIR/push_to_misub.py" | awk '{print $1}')
   secret_file="${MISUB_TOKEN_FILE:-$CFST_DIR/secrets/misub.env}"
   if [ -f "$secret_file" ]; then
@@ -189,9 +238,18 @@ compute_apply_state() {
     secret_hash=missing
   fi
   {
+    # 落地方式参与状态：同内容换通道也算变更，否则切回时会被判"无变化"而跳过首次推送。
+    printf 'publish=%s\n' "${CFST_PUBLISH:-both}"
+    printf 'dns_top=%s\n' "${CFST_DNS_TOP_N:-1}"
+    if [[ "${CFST_PUBLISH:-both}" != misub && -n "$preferred" && "$preferred" != "${members%%$'\n'*}" ]]; then
+      printf 'dns_preference=%s\n' "$preferred"
+    fi
     printf 'template=%s\n' "$template_hash"
+    template_fingerprint
     printf 'secret=%s\n' "$secret_hash"
-    publish_set
+    if [ -n "$members" ]; then
+      printf '%s\n' "$members"
+    fi
   } | md5sum | cut -d' ' -f1
 }
 
@@ -212,23 +270,42 @@ else
 fi
 
 # 节点模板参数：config.sh 是唯一声明源；Shell 关联数组和 Python Region 均从这些无 secret 标量投影。
-# 连接地址由待测 IP 注入。HK/SG 是 CFST 当前自动管理的地区；JP 节点由手动订阅维护，不在 CFST 推送范围。
+# 连接地址由待测 IP 注入。HK/SG/HT 是 CFST 当前自动管理的地区；JP 节点由手动订阅维护，不在 CFST 推送范围。
+# QUERY 是该地区订阅节点的固定参数串（传输方式、padding 全在里面），推送时只替换 IP。
+# AUDIT_KEY 指定用哪套 NODE 参数做可用性探测：探测只需同一批 IP 的链路质量，
+# 目前只有 ws 端点可探测（SG），HK/HT 的 xhttp 参数只用于生成订阅节点。
 CFST_TEMPLATE_HK_KEY=HK
-CFST_TEMPLATE_HK_NAME_PREFIX="🇭🇰 HK Senior"
-CFST_TEMPLATE_HK_SNI="hksenior.example.com"
-CFST_TEMPLATE_HK_HOST="hksenior.example.com"
+CFST_TEMPLATE_HK_NAME_PREFIX="🇭🇰 HK Example"
+# HK 入口：ws /argo?ed=2560 @ hksenior（2026-11-24 15:0x 换回；xhttp 入口已不通）
+# argo xhttp 备用: encryption=none&security=tls&sni=hk-relay.example.com&fp=chrome&type=xhttp&host=hk-relay.example.com&path=%2Fargo&mode=auto&extra=%7B%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingMethod%22%3A%22tokenish%22%2C%22xPaddingPlacement%22%3A%22queryInHeader%22%2C%22xPaddingHeader%22%3A%22X-Cache%22%2C%22xPaddingKey%22%3A%22_Luckylos%22%7D
+CFST_TEMPLATE_HK_QUERY='encryption=none&security=tls&sni=hk-relay.example.com&fp=chrome&type=ws&host=hk-relay.example.com&path=%2Fargo%3Fed%3D2560'
+CFST_TEMPLATE_HK_AUDIT_KEY=HK
+CFST_TEMPLATE_HK_SNI="hk-relay.example.com"
+CFST_TEMPLATE_HK_HOST="hk-relay.example.com"
 CFST_TEMPLATE_HK_PATH="/argo?ed=2560"
 CFST_TEMPLATE_HK_FP="chrome"
 CFST_TEMPLATE_HK_ALPN=""
 CFST_TEMPLATE_HK_LEGACY_INSECURE_FLAGS=0
 CFST_TEMPLATE_SG_KEY=SG
-CFST_TEMPLATE_SG_NAME_PREFIX="🇸🇬 SG Legend"
-CFST_TEMPLATE_SG_SNI="sglegend.example.com"
-CFST_TEMPLATE_SG_HOST="sglegend.example.com"
+CFST_TEMPLATE_SG_NAME_PREFIX="🇸🇬 SG Example"
+CFST_TEMPLATE_SG_QUERY='encryption=none&security=tls&sni=sg-relay.example.com&fp=chrome&type=ws&host=sg-relay.example.com&path=%2Fargo%3Fed%3D2560&insecure=0&allowInsecure=0'
+CFST_TEMPLATE_SG_AUDIT_KEY=SG
+CFST_TEMPLATE_SG_SNI="sg-relay.example.com"
+CFST_TEMPLATE_SG_HOST="sg-relay.example.com"
 CFST_TEMPLATE_SG_PATH="/argo?ed=2560"
 CFST_TEMPLATE_SG_FP="chrome"
 CFST_TEMPLATE_SG_ALPN=""
 CFST_TEMPLATE_SG_LEGACY_INSECURE_FLAGS=1
+CFST_TEMPLATE_HT_KEY=HT
+CFST_TEMPLATE_HT_NAME_PREFIX="🇭🇰 HT Example"
+CFST_TEMPLATE_HT_QUERY='encryption=none&security=tls&sni=ht-relay.example.com&fp=chrome&insecure=0&allowInsecure=0&type=xhttp&host=ht-relay.example.com&path=%2Fargo&mode=auto&extra=%7B%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingMethod%22%3A%22tokenish%22%2C%22xPaddingPlacement%22%3A%22queryInHeader%22%2C%22xPaddingHeader%22%3A%22X-Cache%22%2C%22xPaddingKey%22%3A%22_Luckylos%22%7D'
+CFST_TEMPLATE_HT_AUDIT_KEY=SG
+CFST_TEMPLATE_HT_SNI="ht-relay.example.com"
+CFST_TEMPLATE_HT_HOST="ht-relay.example.com"
+CFST_TEMPLATE_HT_PATH="/argo"
+CFST_TEMPLATE_HT_FP="chrome"
+CFST_TEMPLATE_HT_ALPN=""
+CFST_TEMPLATE_HT_LEGACY_INSECURE_FLAGS=1
 
 declare -A NODE_HK=(
   [key]="$CFST_TEMPLATE_HK_KEY"
@@ -240,6 +317,7 @@ declare -A NODE_HK=(
   [alpn]="$CFST_TEMPLATE_HK_ALPN"
   [prefix]="$CFST_TEMPLATE_HK_NAME_PREFIX"
   [legacy_insecure_flags]="$CFST_TEMPLATE_HK_LEGACY_INSECURE_FLAGS"
+  [query]="$CFST_TEMPLATE_HK_QUERY"
 )
 declare -A NODE_SG=(
   [key]="$CFST_TEMPLATE_SG_KEY"
@@ -251,4 +329,17 @@ declare -A NODE_SG=(
   [alpn]="$CFST_TEMPLATE_SG_ALPN"
   [prefix]="$CFST_TEMPLATE_SG_NAME_PREFIX"
   [legacy_insecure_flags]="$CFST_TEMPLATE_SG_LEGACY_INSECURE_FLAGS"
+  [query]="$CFST_TEMPLATE_SG_QUERY"
+)
+declare -A NODE_HT=(
+  [key]="$CFST_TEMPLATE_HT_KEY"
+  [sni]="$CFST_TEMPLATE_HT_SNI"
+  [host]="$CFST_TEMPLATE_HT_HOST"
+  [path]="$CFST_TEMPLATE_HT_PATH"
+  [uuid]="$VLESS_UUID"
+  [fp]="$CFST_TEMPLATE_HT_FP"
+  [alpn]="$CFST_TEMPLATE_HT_ALPN"
+  [prefix]="$CFST_TEMPLATE_HT_NAME_PREFIX"
+  [legacy_insecure_flags]="$CFST_TEMPLATE_HT_LEGACY_INSECURE_FLAGS"
+  [query]="$CFST_TEMPLATE_HT_QUERY"
 )

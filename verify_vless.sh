@@ -43,23 +43,34 @@ fi
 VLESS_TRIES=${VLESS_TRIES:-3}                      # 每个 IP 测试次数
 VLESS_TEMPLATE=${VLESS_TEMPLATE:-HK}
 case "$VLESS_TEMPLATE" in
-  HK)
-    VLESS_HOST="${NODE_HK[host]}"
-    VLESS_PATH="${NODE_HK[path]}"
-    VLESS_UUID="${NODE_HK[uuid]}"
-    VLESS_FP="${NODE_HK[fp]}"
-    ;;
-  SG)
-    VLESS_HOST="${NODE_SG[host]}"
-    VLESS_PATH="${NODE_SG[path]}"
-    VLESS_UUID="${NODE_SG[uuid]}"
-    VLESS_FP="${NODE_SG[fp]}"
-    ;;
+  HK) VLESS_NODE="NODE_HK" ;;
+  SG) VLESS_NODE="NODE_SG" ;;
+  HT) VLESS_NODE="NODE_HT" ;;
   *)
-    echo "verify_vless: unsupported VLESS_TEMPLATE=$VLESS_TEMPLATE (expected HK or SG)" >&2
+    echo "verify_vless: unsupported VLESS_TEMPLATE=$VLESS_TEMPLATE (expected HK, SG or HT)" >&2
     exit 2
     ;;
 esac
+declare -n VLESS_REF="$VLESS_NODE"
+VLESS_HOST="${VLESS_REF[host]}"
+VLESS_PATH="${VLESS_REF[path]}"
+VLESS_UUID="${VLESS_REF[uuid]}"
+VLESS_FP="${VLESS_REF[fp]}"
+VLESS_QUERY="${VLESS_REF[query]:-}"
+unset -n VLESS_REF
+# 推送 preflight 会带上节点自己那份凭据与参数（HT 与 HK/SG 的 uuid 不同）。
+VLESS_UUID="${VLESS_TEMPLATE_UUID:-$VLESS_UUID}"
+VLESS_QUERY="${VLESS_TEMPLATE_QUERY:-$VLESS_QUERY}"
+# 探测必须与用户实际使用的传输一致：ws / xhttp 由模板 QUERY 决定，不在此处写死。
+if [[ -n "$VLESS_QUERY" ]]; then
+  STREAM_SETTINGS=$(python3 "$CFST_DIR/vless_template.py" --query "$VLESS_QUERY") || {
+    echo "verify_vless: 无法从 QUERY 解析传输配置（$VLESS_TEMPLATE）" >&2
+    exit 2
+  }
+else
+  # 旧配置只有 host/path/fp 时按 ws 建链，保持向后兼容。
+  STREAM_SETTINGS=$(python3 "$CFST_DIR/vless_template.py" --ws-host "$VLESS_HOST" --ws-path "$VLESS_PATH" --ws-fp "$VLESS_FP") || exit 2
+fi
 if [[ -z "$VLESS_UUID" ]]; then
   echo "verify_vless: VLESS_UUID 不可用（检查 $VLESS_SECRET_FILE）；拒绝以空凭据探测，避免误判退役" >&2
   exit 2
@@ -90,7 +101,7 @@ fi
 if $AUDIT_MODE && [ -n "$INPUT_FILE" ]; then
   # 审计模式：读取文件中所有非注释非空行
   mapfile -t ALL_IPS < <(
-    grep -E '^[0-9]' "$INPUT_FILE" | python3 "$CFST_DIR/ip_validation.py" --filter
+    grep -E '^[0-9]' "$INPUT_FILE" | python3 "$CFST_DIR/ip_validation.py" --filter | awk '!seen[$0]++'
   )
 elif [ -n "$INPUT_FILE" ]; then
   mapfile -t ALL_IPS < <(
@@ -118,6 +129,16 @@ chmod 700 "$VERIFY_TMPDIR_BASE"
 find "$VERIFY_TMPDIR_BASE" -maxdepth 1 -mindepth 1 -type d -name 'verify.*' -mmin +180 -exec rm -rf {} + 2>/dev/null || true
 TMPDIR_VERIFY=$(mktemp -d "$VERIFY_TMPDIR_BASE/verify.XXXXXX")
 chmod 700 "$TMPDIR_VERIFY"
+OBS_INPUT="$TMPDIR_VERIFY/observations"
+REFERENCE_KEY=""
+if $AUDIT_MODE && [ -n "${VLESS_REFERENCE_OUT:-}" ] && [ -z "${VLESS_NO_RECORD:-}" ]; then
+  REFERENCE_KEY=$(printf '%s\0' "$VLESS_TEMPLATE" "$STREAM_SETTINGS" "$VLESS_VERIFY_URL" \
+    "$BYPASS_GID" "$VLESS_VERIFY_TIMEOUT" "$VLESS_TRIES" | python3 "$CFST_DIR/quality_evidence.py" reference)
+  if [ -n "${VLESS_AUDIT_RUN:-}" ]; then
+    python3 "$CFST_DIR/audit_evidence.py" bind "$VLESS_REFERENCE_OUT" \
+      "$VLESS_AUDIT_RUN" "$REFERENCE_KEY" "${ALL_IPS[@]}"
+  fi
+fi
 PIDS=()
 PGIDS=()
 
@@ -208,6 +229,8 @@ trap 'on_signal 143' TERM
 # ── 结果收集 ──
 declare -A RESULTS  # ip -> "PASS|FAIL|PARTIAL median_ms [reason]"
 
+declare -a HISTORY_BUFFER=()
+
 append_vless_history() {
   local ip="$1"
   local status="$2"   # PASS|FAIL|PARTIAL
@@ -215,7 +238,35 @@ append_vless_history() {
   local reason="${4:-}"
   local ts
   ts=$(date '+%F %T')
-  printf '%s\t%s\t%s\t%s\t%s\n' "$ts" "$ip" "$status" "$median" "$reason" >> "$VLESS_HISTORY"
+  HISTORY_BUFFER+=("$(printf '%s\t%s\t%s\t%s\t%s' "$ts" "$ip" "$status" "$median" "$reason")")
+}
+
+# 写盘前统一裁决：一次运行里 IP 全部死在传输层（timeout/xray 起不来），
+# 那是入口不可用，不是这些 IP 的证据；记进去会冤枉一池子好 IP。
+flush_vless_history() {
+  local total=${#HISTORY_BUFFER[@]}
+  [ "$total" -gt 0 ] || return 0
+  if [ -n "${VLESS_NO_RECORD:-}" ]; then
+    echo "verify_vless: VLESS_NO_RECORD set; $total record(s) discarded" >&2
+    HISTORY_BUFFER=()
+    return 0
+  fi
+  if [ "$total" -ge 5 ]; then
+    local transport=0 row reason
+    for row in "${HISTORY_BUFFER[@]}"; do
+      reason="${row##*$'\t'}"
+      case "$reason" in
+        timeout|xray_start_failed) (( transport++ )) || true ;;
+      esac
+    done
+    if [ "$transport" -eq "$total" ]; then
+      echo "verify_vless: all $total IPs failed at the transport layer; entry looks unavailable — discarding this run instead of blaming the IPs" >&2
+      HISTORY_BUFFER=()
+      return 0
+    fi
+  fi
+  printf '%s\n' "${HISTORY_BUFFER[@]}" >> "$VLESS_HISTORY"
+  HISTORY_BUFFER=()
 }
 
 prune_vless_history() {
@@ -247,7 +298,7 @@ verify_batch() {
 {
   "log": {"loglevel": "none"},
   "inbounds": [{"listen": "127.0.0.1", "port": ${port}, "protocol": "http", "settings": {}}],
-  "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "${ip}", "port": 443, "users": [{"id": "${VLESS_UUID}", "encryption": "none"}]}]}, "streamSettings": {"network": "ws", "security": "tls", "tlsSettings": {"serverName": "${VLESS_HOST}", "fingerprint": "${VLESS_FP}"}, "wsSettings": {"path": "${VLESS_PATH}", "headers": {"Host": "${VLESS_HOST}"}}}}]
+  "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "${ip}", "port": 443, "users": [{"id": "${VLESS_UUID}", "encryption": "none"}]}]}, "streamSettings": $STREAM_SETTINGS}]
 }
 EOF
 
@@ -303,6 +354,9 @@ EOF
     if ! ss -tlnp 2>/dev/null | grep -q ":${port} "; then
       RESULTS["$ip"]="FAIL 0 (xray_start_failed)"
       append_vless_history "$ip" "FAIL" "0" "xray_start_failed"
+      if [ -n "$REFERENCE_KEY" ]; then
+        printf '%s\t%s\txray_start_failed\n' "$(date '+%FT%T')" "$ip" >> "$OBS_INPUT"
+      fi
       continue
     fi
 
@@ -312,20 +366,27 @@ EOF
       urls_args+=("$VLESS_VERIFY_URL" -o /dev/null)
     done
 
-    local raw_output curl_rc
+    local raw_output curl_rc observed_at
+    observed_at=$(date '+%FT%T')
     if raw_output=$(curl -s \
       --proxy "$proxy" \
       --connect-timeout "$VLESS_VERIFY_TIMEOUT" \
       --max-time $(( VLESS_VERIFY_TIMEOUT * (VLESS_TRIES + 1) )) \
       "${urls_args[@]}" \
-      -w '%{http_code}\t%{time_starttransfer}\n' 2>/dev/null
+      -w '%{urlnum}\t%{http_code}\t%{time_starttransfer}\t%{exitcode}\n' 2>/dev/null
     ); then
       curl_rc=0
     else
       curl_rc=$?
     fi
 
-    # 解析：跳第一行（warmup），后续同时保留 HTTP 状态与 TTFB。
+    if [ -n "$REFERENCE_KEY" ]; then
+      printf '%s\t%s\t%s\n' "$observed_at" "$ip" "${raw_output//$'\n'/|}" >> "$OBS_INPUT"
+    fi
+    local structured=false first_line="${raw_output%%$'\n'*}"
+    if [[ "$first_line" == *$'\t'*$'\t'*$'\t'* ]]; then
+      structured=true
+    fi
     # 只有 2xx 才算成功样本；非 2xx 的正 TTFB 仍可证明链路可测，
     # 因而归入 slow/fail 而不是 unreachable。
     local ttfbs=()
@@ -337,7 +398,19 @@ EOF
     while IFS= read -r line; do
       [ -z "$line" ] && continue
       (( line_num++ )) || true
-      (( line_num == 1 )) && continue
+      if $structured; then
+        local transfer_index="${line%%$'\t'*}" transfer_rc="${line##*$'\t'}"
+        [[ "$transfer_index" =~ ^[0-9]+$ ]] || continue
+        (( transfer_index == 0 || transfer_index > VLESS_TRIES )) && continue
+        line="${line#*$'\t'}"
+        line="${line%$'\t'*}"
+        if [[ "$transfer_rc" != 0 ]]; then
+          (( attempts_seen++, timeouts++ )) || true
+          continue
+        fi
+      elif (( line_num == 1 )); then
+        continue
+      fi
       (( attempts_seen++ )) || true
       local http_code timing ms
       if [[ "$line" == *$'\t'* ]]; then
@@ -457,6 +530,19 @@ for ip in "${ALL_IPS[@]}"; do
   fi
 done
 
+if [ -n "$REFERENCE_KEY" ] && [ -s "$OBS_INPUT" ]; then
+  if [ -n "${VLESS_AUDIT_RUN:-}" ]; then
+    python3 "$CFST_DIR/audit_evidence.py" record "${VLESS_HISTORY}.requests.jsonl" \
+      "$VLESS_REFERENCE_OUT" "$VLESS_AUDIT_RUN" "$REFERENCE_KEY" "$VLESS_TRIES" \
+      "${ALL_IPS[@]}" < "$OBS_INPUT"
+  else
+    OBS_BATCH="$(date +%s%N)-$$"
+    python3 "$CFST_DIR/quality_evidence.py" record "${VLESS_HISTORY}.requests.jsonl" \
+      "$REFERENCE_KEY" "$OBS_BATCH" "$VLESS_TRIES" < "$OBS_INPUT"
+    printf '%s\n%s\n' "$REFERENCE_KEY" "$OBS_BATCH" > "$VLESS_REFERENCE_OUT"
+  fi
+fi
+flush_vless_history || true
 prune_vless_history || true
 echo "[$(date '+%F %T')] verify_vless: ${pass_count}/${total} IPs passed, ${fail_count} failed" >&2
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import subprocess
 import tempfile
 import sys
 import unittest
@@ -96,7 +97,7 @@ class PreflightSafetyTests(unittest.TestCase):
             ]
         )
 
-        def fake_audit(region_arg, ips_arg, _temp_path, attempt):
+        def fake_audit(region_arg, ips_arg, _temp_path, attempt, **_kwargs):
             calls.append((region_arg["key"], list(ips_arg), attempt))
             return next(outcomes)
 
@@ -117,6 +118,20 @@ class PreflightSafetyTests(unittest.TestCase):
         self.assertEqual(calls[2][1], [ips[1]])
         self.assertIn("transient-recovered", stdout.getvalue())
 
+    def test_verifier_busy_is_a_deferral_not_a_candidate_failure(self) -> None:
+        """rc=75（验证锁被占）不能算候选失败，也不能让整轮推送判死。"""
+        region = {"key": "HK"}
+        completed = subprocess.CompletedProcess(args=[], returncode=75, stdout="", stderr="busy")
+
+        with tempfile.TemporaryDirectory() as raw:
+            with (
+                patch.object(push, "VERIFY_SCRIPT", Path(raw) / "verify_vless.sh"),
+                patch.object(push.subprocess, "run", return_value=completed),
+            ):
+                Path(push.VERIFY_SCRIPT).write_text("#!/bin/sh\n")
+                with self.assertRaisesRegex(RuntimeError, "verifier busy"):
+                    push._run_region_audit(region, ["2.2.2.2"], Path(raw), "initial")
+
     def test_recovery_failure_remains_fail_closed(self) -> None:
         region = {"key": "SG"}
         ip = "2.2.2.2"
@@ -133,15 +148,26 @@ class PreflightSafetyTests(unittest.TestCase):
             verifier.write_text("#!/bin/sh\n")
             with (
                 patch.object(push, "VERIFY_SCRIPT", verifier),
-                patch.object(push, "_run_region_audit", side_effect=lambda *args: next(outcomes)),
+                patch.object(push, "_run_region_audit", side_effect=lambda *args, **kwargs: next(outcomes)),
             ):
                 with self.assertRaisesRegex(RuntimeError, r"SG region preflight failed: 2\.2\.2\.2=FAIL"):
                     push.run_region_preflight(region, [ip])
 
-    def test_main_does_not_call_misub_when_preflight_fails(self) -> None:
+    def test_main_writes_nothing_when_preflight_fails(self) -> None:
+        """preflight 失败必须发生在任何远端写入之前。
+
+        读取是允许的：目标状态要从节点现有凭据推导（HT 与 HK/SG 的 uuid 不同）。
+        """
         with (
             patch.object(push, "read_best_ips", return_value=["1.1.1.1", "2.2.2.2", "3.3.3.3"]),
-            patch.object(push, "run_all_region_preflights", side_effect=RuntimeError("preflight failed")),
+            patch.object(push._PushExecution, "list_managed_nodes", return_value=[]),
+            patch.object(push._PushExecution, "list_profiles",
+                         return_value=[{"id": "target", "name": push.PROFILE_NAME, "manualNodes": []}]),
+            patch.object(push._PushExecution, "get_profile_refs", return_value=[]),
+            patch.object(push._PushExecution, "resolve_nodes_by_id",
+                         return_value=push.NodeResolution(found={}, missing={}, unknown={})),
+            patch.object(push._PushExecution, "other_profile_refs", return_value={}),
+            patch.object(push, "_prepare_desired_urls", side_effect=RuntimeError("preflight failed")),
             patch.object(push, "api_request") as api_request,
         ):
             with self.assertRaisesRegex(RuntimeError, "preflight failed"):
