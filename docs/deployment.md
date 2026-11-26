@@ -18,7 +18,7 @@ touch .push_disabled
 - 安装 Bash 4.3+、Python 3.11+、`curl` 7.75+（须支持 `%{exitcode}`）、`iproute2`（`ss`）、`util-linux`（`flock`、`setpriv`、`setsid`）、GNU coreutils 和 `mtr`。使用 cron 调度时，主机需要运行 cron 服务。
 - 按主机架构获取 CloudflareST 和 Xray，并按上游说明验证下载。将可执行文件分别放到 `/opt/cfst/cfst` 和 `/opt/cfst/bin/xray`，权限设为 `0755`。 [CloudflareST 发布](https://github.com/XIU2/CloudflareSpeedTest/releases) · [Xray 发布](https://github.com/XTLS/Xray-core/releases)
 - 在 `config.sh` 中把 `BYPASS_GID` 改成适合本机的数字 GID。没有 TUN 策略路由且按本教程用 root 运行时可用 `0`。有 TUN 时，选用已配置为直连的 GID，并确认该组能出站。
-- 新建 `ip_ranges.txt`，每行一个由你选择的 IPv4 地址或 CIDR。`#` 开头的注释行和空行会被跳过。
+- 按[第 3 节](#3-准备扫描目标筛选候选并初始化快照)准备 `ip_ranges.txt` 和首批候选。
 
 ```bash
 python3 --version
@@ -53,15 +53,45 @@ install -m 0600 /dev/null /root/.config/credentials/cloudflare.env
 
 在 `config.sh` 中将 `CFST_PUBLISH` 的默认值设为你要使用的 `dns`、`misub` 或 `both`，让手动与 cron 走同一配置。默认是 `both`。默认 `CFST_DNS_TOP_N=1`，DNS 适配器创建 DNS-only A 记录，TTL 为 60 秒。在首轮测试前决定是否执行 `touch .quality_evidence_enabled`。该文件启用单地址 DNS 首选选择。
 
-## 3. 筛选候选并初始化快照
+## 3. 准备扫描目标、筛选候选并初始化快照
 
-新部署要先建立三位发布成员，在线排名会校验快照成员数。把由你选定的候选 IPv4 每行一个写入 `secrets/seed-candidates.txt`。候选来自你自己管理的测试目标，可先用 CloudflareST 做 TCP 发现。保持 `.push_disabled`，先执行实际 VLESS 快筛。
+### 扫描目标从哪里来
+
+在 `/opt/cfst/ip_ranges.txt` 中每行填写一个待测 IPv4 地址或 CIDR。初次部署的 TCP 扫描从这份文件取目标。可以从 Cloudflare 公布的 IPv4 网段选取一部分，也可以填入你已有的合法测试地址。官方名单是网段来源，实际位置和延迟以部署主机的探测结果为准。项目不会自动下载网段，公开包也不附带生产网段。 [Cloudflare IPv4 网段](https://www.cloudflare.com/ips-v4)
+
+文件支持整行注释和空行，格式如下。这里的地址只用于展示格式，部署时换成实际待测地址。
+
+```text
+# 每行一个 IPv4 地址或 CIDR
+192.0.2.0/24
+198.51.100.42
+```
+
+每轮扫描合并 `ip_ranges.txt`、`discovered_ips.tsv` 中仍有效的候选、`contenders.tsv` 的已有成员，以及存在时的旧版 `master_ips.txt`。去重后用 CloudflareST 测 TCP 443 平均延迟。新地址低于 `QUAL_LAT`（默认 70 ms）且通过冷却、网段过滤等条件后，写入 `discovered_ips.tsv`。这份发现队列默认保留 24 小时，最多 180 条。
+
+有了评分池后，正常慢周期每轮按剩余容量从发现队列最多选 20 个候选，用 VLESS 测试真实链路。快筛通过的地址写入 `contenders.tsv`，随后参与排名和分层。
+
+### 从发现队列筛出首批成员
+
+首次启动需要先从已通过 VLESS 快筛的地址中选定三个发布成员。保持 `.push_disabled` 并暂不开启 cron。执行一次 TCP 扫描，按平均延迟升序从发现队列选最多 20 个，再做 VLESS 快筛。
 
 ```bash
-cd /opt/cfst
-umask 077
-VLESS_TEMPLATE=HK bash verify_vless.sh --screen secrets/seed-candidates.txt secrets/seed-passed.txt
+(
+  set -euo pipefail
+  cd /opt/cfst
+  umask 077
+  test -f .push_disabled
+  bash scan_latency.sh
+  test -s discovered_ips.tsv
+  awk -F '\t' '$1 !~ /^#/ && $2 != "" && $4 + 0 > 0 { print $4, $2 }' discovered_ips.tsv \
+    | sort -k1,1n -k2,2 \
+    | awk 'NR <= 20 { print $2 }' > secrets/seed-candidates.txt
+  test -s secrets/seed-candidates.txt
+  VLESS_TEMPLATE=HK bash verify_vless.sh --screen secrets/seed-candidates.txt secrets/seed-passed.txt
+)
 ```
+
+`discovered_ips.tsv` 的第 2 列是 IPv4，第 4 列是 TCP 平均延迟（ms）。若已有待验证的 IPv4，也可直接按每行一个写入 `secrets/seed-candidates.txt`，然后执行上面最后一条 `--screen` 命令。若 TCP 扫描没有生成候选，可先检查 `ip_ranges.txt`、直连路径和探测日志，再按本机 RTT 核对 `QUAL_LAT`。
 
 `--screen` 可能以成功状态退出但没有通过项。检查输出，只挑三位通过快筛的不同 IPv4，按期望槽位顺序写入 `secrets/seed-selected.txt`。MiSub 发布还会按启用的地区做实际链路预检。先在手动维护窗口运行以下首次初始化命令，保持 cron 未启用。
 
