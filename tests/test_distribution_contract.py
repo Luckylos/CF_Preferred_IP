@@ -113,6 +113,7 @@ def test_publication_contains_no_literal_credentials():
 
 def test_relay_endpoints_are_placeholders():
     config = (ROOT / "config.sh").read_text(encoding="utf-8")
+    assert re.search(r'^COLO_HOST="trace\.example\.com"(?:\s|$)', config, re.M)
     for key in ("HK", "HT", "SG"):
         for field in ("SNI", "HOST"):
             match = re.search(rf'^CFST_TEMPLATE_{key}_{field}="([^"]+)"', config, re.M)

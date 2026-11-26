@@ -84,7 +84,7 @@ DISCOVERED="$CFST_DIR/discovered_ips.tsv"  # 发现队列：时间戳<TAB>IP<TAB
 SCAN="$CFST_DIR/ip_ranges.txt"
 BEST="$CFST_DIR/best_ips.txt"
 ROUTES="$CFST_DIR/routes.tsv"
-COLO_HOST="vls.meibidi.pp.ua"  # cdn-cgi/trace 用的 CF 域名（probe.sh MTR colo 检测）
+COLO_HOST="trace.example.com"  # cdn-cgi/trace 用的 CF 域名（probe.sh MTR colo 检测）
 
 # 运行控制
 CFST_LOCK=/run/lock/cfst.lock
