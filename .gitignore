@@ -22,7 +22,6 @@ contenders.tsv.lifecycle.json
 .dns_preference.json
 .quality_evidence_enabled
 .misub-reconcile-pending.json
-ip_ranges.txt
 segment_verdicts.tsv
 .segment_verdicts.tsv.tmp.*
 .apply_cooldown

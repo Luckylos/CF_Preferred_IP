@@ -20,6 +20,7 @@ ROOT = Path(__file__).parents[1]
 
 REQUIRED_FILES = [
     "README.md",
+    "docs/deployment.md",
     "config.sh",
     "cycle.sh",
     "cycle_result.py",
@@ -63,7 +64,6 @@ RUNTIME_STATE_NAMES = {
     ".apply_state",
     ".capacity_cooldown.tsv",
     ".screen_blacklist.tsv",
-    "ip_ranges.txt",
 }
 
 DOC_RANGES = ("127.0.0.", "192.0.2.", "198.51.100.", "203.0.113.")
@@ -92,6 +92,12 @@ def test_publication_keeps_the_operational_surface():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "secrets/" in readme
     assert "example.com" in readme
+
+
+def test_publication_includes_an_empty_scan_input():
+    ranges = ROOT / "ip_ranges.txt"
+    assert ranges.is_file() and not ranges.is_symlink()
+    assert ranges.read_bytes() == b""
 
 
 def test_publication_contains_no_credential_or_runtime_state_surfaces():

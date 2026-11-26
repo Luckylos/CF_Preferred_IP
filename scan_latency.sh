@@ -46,6 +46,10 @@ QUEUE_COUNTS=$(python3 "$CFST_DIR/admission.py" maintain --queue "$DISCOVERED" \
     | python3 "$CFST_DIR/ip_validation.py" --filter-network || true
 } | awk '!seen[$0]++' > "$TARGET"
 TARGET_COUNT=$(awk 'END {print NR + 0}' "$TARGET")
+if [ "$TARGET_COUNT" -eq 0 ]; then
+  echo "[$QUEUE_NOW] latency scan: no valid scan targets (add IPv4 or CIDRs to $SCAN)"
+  exit 0
+fi
 
 # -dd 而非 -dn 0：-dn 是「下载测速数量」，-dd 才是「禁用下载测速」。传 -dn 0 会落回
 # 默认队列 10 个 IP，每个最长 -dt 10 秒 —— 实测全量 113.4s、单网段 83~100s，直接撞满

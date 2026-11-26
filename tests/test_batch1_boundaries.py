@@ -137,6 +137,13 @@ exit {cfst_rc}
     return sandbox, proc
 
 
+def test_scanner_skips_cfst_when_configured_input_and_pools_are_empty(tmp_path: Path) -> None:
+    sandbox, result = _scan_sandbox(tmp_path, discovered="", scan_input="")
+    assert result.returncode == 0, result.stderr
+    assert not (sandbox / "captured-target").exists()
+    assert "no valid scan targets" in result.stdout
+
+
 def test_ipv4_boundary_rejects_semantic_and_shell_invalid_values() -> None:
     """合法 IPv4 通过；越界、IPv6 和 shell 特殊值必须拒绝。"""
     proc = subprocess.run(

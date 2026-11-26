@@ -57,7 +57,7 @@ install -m 0600 /dev/null /root/.config/credentials/cloudflare.env
 
 ### 扫描目标从哪里来
 
-在 `/opt/cfst/ip_ranges.txt` 中每行填写一个待测 IPv4 地址或 CIDR。初次部署的 TCP 扫描从这份文件取目标。可以从 Cloudflare 公布的 IPv4 网段选取一部分，也可以填入你已有的合法测试地址。官方名单是网段来源，实际位置和延迟以部署主机的探测结果为准。项目不会自动下载网段，公开包也不附带生产网段。 [Cloudflare IPv4 网段](https://www.cloudflare.com/ips-v4)
+仓库随附空的 `/opt/cfst/ip_ranges.txt`。每行填写一个待测 IPv4 地址或 CIDR，填写后的扫描范围只保存在部署主机。初次部署的 TCP 扫描从这份文件取目标。可以从 Cloudflare 公布的 IPv4 网段选取一部分，也可以填入你已有的合法测试地址。官方名单是网段来源，实际位置和延迟以部署主机的探测结果为准。项目不会自动下载网段，公开包只提供空模板。扫描没有任何有效目标时会记录 `no valid scan targets` 并跳过测速。 [Cloudflare IPv4 网段](https://www.cloudflare.com/ips-v4)
 
 文件支持整行注释和空行，格式如下。这里的地址只用于展示格式，部署时换成实际待测地址。
 
@@ -87,11 +87,25 @@ install -m 0600 /dev/null /root/.config/credentials/cloudflare.env
     | sort -k1,1n -k2,2 \
     | awk 'NR <= 20 { print $2 }' > secrets/seed-candidates.txt
   test -s secrets/seed-candidates.txt
-  VLESS_TEMPLATE=HK bash verify_vless.sh --screen secrets/seed-candidates.txt secrets/seed-passed.txt
 )
 ```
 
-`discovered_ips.tsv` 的第 2 列是 IPv4，第 4 列是 TCP 平均延迟（ms）。若已有待验证的 IPv4，也可直接按每行一个写入 `secrets/seed-candidates.txt`，然后执行上面最后一条 `--screen` 命令。若 TCP 扫描没有生成候选，可先检查 `ip_ranges.txt`、直连路径和探测日志，再按本机 RTT 核对 `QUAL_LAT`。
+`discovered_ips.tsv` 的第 2 列是 IPv4，第 4 列是 TCP 平均延迟（ms）。若已有待验证的 IPv4，也可直接按每行一个写入 `secrets/seed-candidates.txt`。若 TCP 扫描没有生成候选，可先检查 `ip_ranges.txt`、直连路径和探测日志，再按本机 RTT 核对 `QUAL_LAT`。
+
+每次运行快筛都清空上一轮名单。空结果时先查看快筛日志。
+
+```bash
+(
+  set -euo pipefail
+  cd /opt/cfst
+  umask 077
+  : > secrets/seed-passed.txt
+  test -x bin/xray
+  test -s secrets/seed-candidates.txt
+  VLESS_TEMPLATE=HK bash verify_vless.sh --screen secrets/seed-candidates.txt secrets/seed-passed.txt
+  test -s secrets/seed-passed.txt
+)
+```
 
 `--screen` 可能以成功状态退出但没有通过项。检查输出，只挑三位通过快筛的不同 IPv4，按期望槽位顺序写入 `secrets/seed-selected.txt`。MiSub 发布还会按启用的地区做实际链路预检。先在手动维护窗口运行以下首次初始化命令，保持 cron 未启用。
 

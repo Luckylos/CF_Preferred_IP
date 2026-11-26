@@ -42,7 +42,7 @@ python -m pytest tests/test_rank_cli.py tests/test_audit_evidence.py tests/test_
 | 发布 | `apply.sh` | 按同一快照独立协调 DNS 和 MiSub，记录已应用或待发布指纹 |
 | 观察与回放 | `status.py` / `replay.py` | 查看当前状态，或按指定参考和截止时间回放已有证据 |
 
-**延迟筛选池从哪里来？** 首次部署由你把待测 IPv4 地址或 CIDR 写入 `ip_ranges.txt`。可从 Cloudflare 公布的 IPv4 网段选取一部分作为起点。运行后，每轮扫描还会纳入评分池和发现队列里的已有地址。通过 TCP 初筛的地址进入发现队列，通过 VLESS 快筛的地址才进入评分池。 [Cloudflare IPv4 网段](https://www.cloudflare.com/ips-v4) · [候选来源与首次筛选](docs/deployment.md#3-准备扫描目标筛选候选并初始化快照)
+**延迟筛选池从哪里来？** 仓库随附空的 `ip_ranges.txt`。首次部署把待测 IPv4 地址或 CIDR 填进去，留空且没有其它候选时会跳过测速。可从 Cloudflare 公布的 IPv4 网段选取一部分作为起点。运行后，每轮扫描还会纳入评分池和发现队列里的已有地址。通过 TCP 初筛的地址进入发现队列，通过 VLESS 快筛的地址才进入评分池。 [Cloudflare IPv4 网段](https://www.cloudflare.com/ips-v4) · [候选来源与首次筛选](docs/deployment.md#3-准备扫描目标筛选候选并初始化快照)
 
 当前发布集包含三个有序成员。DNS 默认选择一个 A 记录目标，MiSub 将三个成员映射到各地区的稳定节点槽位。`best_ips.txt` 保留人读榜单和机器可读的 IP 段。
 
